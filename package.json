@@ -1,0 +1,29 @@
+{
+  "name": "fig2r",
+  "version": "0.1.0",
+  "description": "Convert Figma designs to pixel-perfect React + Tailwind components",
+  "license": "MIT",
+  "author": "Tara Depan",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/taradepan/fig2r"
+  },
+  "homepage": "https://github.com/taradepan/fig2r#readme",
+  "keywords": ["figma", "react", "tailwind", "codegen", "design-to-code"],
+  "bin": {
+    "fig2r": "bin/fig2r.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "tar": "^7.4.3"
+  }
+}

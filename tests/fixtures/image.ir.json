@@ -1,0 +1,29 @@
+{
+  "version": "1.0",
+  "name": "ImageDesign",
+  "components": [
+    {
+      "id": "root-1",
+      "name": "Gallery",
+      "type": "frame",
+      "children": [
+        {
+          "id": "img-1",
+          "name": "Hero Image",
+          "type": "image",
+          "children": []
+        }
+      ]
+    }
+  ],
+  "assets": [
+    {
+      "id": "img-1",
+      "name": "Hero Image",
+      "type": "image",
+      "format": "png",
+      "data": "aGVsbG8=",
+      "sourceRef": "image-ref:hash-1"
+    }
+  ]
+}
