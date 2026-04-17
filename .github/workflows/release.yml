@@ -147,7 +147,8 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: "22"
+          # Node 24 bundles npm >= 11.5.1, required for trusted publishing OIDC handshake.
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
       - name: Download platform packages
