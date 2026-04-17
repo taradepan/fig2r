@@ -17,27 +17,20 @@ jobs:
       version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
 
-      - name: Compare package.json version
+      - name: Compare local version to npm
         id: check
         shell: bash
         run: |
           CURR=$(node -p "require('./package.json').version")
-          if git show HEAD~1:package.json >/dev/null 2>&1; then
-            PREV=$(git show HEAD~1:package.json \
-              | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).version))")
-          else
-            PREV=""
-          fi
-          echo "Current: $CURR  Previous: $PREV"
+          PUBLISHED=$(npm view fig2r version 2>/dev/null || echo "")
+          echo "Local: $CURR  On npm: ${PUBLISHED:-<unpublished>}"
           echo "version=$CURR" >> "$GITHUB_OUTPUT"
-          if [ "$CURR" != "$PREV" ]; then
+          if [ "$CURR" != "$PUBLISHED" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "Version unchanged — skipping release."
+            echo "fig2r@$CURR already on npm — skipping release."
           fi
 
   build:
