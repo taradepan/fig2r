@@ -3,7 +3,7 @@
 // optionalDependencies and exec the bundled binary.
 
 const { spawn } = require("node:child_process");
-const { existsSync } = require("node:fs");
+const { chmodSync, existsSync, statSync } = require("node:fs");
 const { createRequire } = require("node:module");
 const path = require("node:path");
 
@@ -46,6 +46,15 @@ try {
 if (!existsSync(binaryPath)) {
   console.error(`[fig2r] Binary not found at ${binaryPath}`);
   process.exit(1);
+}
+
+// npm tarballs strip the executable bit from files not declared in a `bin`
+// field. Restore it here so the spawn doesn't EACCES on first run.
+if (process.platform !== "win32") {
+  try {
+    const mode = statSync(binaryPath).mode;
+    if (!(mode & 0o111)) chmodSync(binaryPath, 0o755);
+  } catch { /* best-effort */ }
 }
 
 const child = spawn(binaryPath, process.argv.slice(2), { stdio: "inherit" });

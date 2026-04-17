@@ -119,7 +119,7 @@ jobs:
               version: process.env.VERSION,
               description: 'Native binary for fig2r (' + process.env.NODE_OS + '-' + process.env.NODE_ARCH + ')',
               license: 'MIT',
-              repository: { type: 'git', url: 'https://github.com/taradepan/fig2r' },
+              repository: { type: 'git', url: 'git+https://github.com/taradepan/fig2r.git' },
               os: [process.env.NODE_OS],
               cpu: [process.env.NODE_ARCH],
               files: ['bin/']
@@ -139,12 +139,15 @@ jobs:
     needs: [detect, build]
     if: needs.detect.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # required for npm Trusted Publishing (OIDC)
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
       - name: Download platform packages
@@ -153,16 +156,12 @@ jobs:
           path: npm-dist
 
       - name: Publish platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           for dir in npm-dist/fig2r-*; do
             echo ">>> publishing $dir"
-            (cd "$dir" && npm publish --access public)
+            (cd "$dir" && npm publish --provenance --access public)
           done
 
       - name: Publish main package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: npm publish --provenance --access public
