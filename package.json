@@ -14,16 +14,17 @@
     "fig2r": "bin/fig2r.js"
   },
   "files": [
-    "bin/",
-    "scripts/"
+    "bin/"
   ],
-  "scripts": {
-    "postinstall": "node scripts/postinstall.js"
-  },
   "engines": {
     "node": ">=18"
   },
-  "dependencies": {
-    "tar": "^7.4.3"
+  "optionalDependencies": {
+    "fig2r-darwin-arm64": "0.1.0",
+    "fig2r-darwin-x64": "0.1.0",
+    "fig2r-linux-arm64": "0.1.0",
+    "fig2r-linux-x64": "0.1.0",
+    "fig2r-win32-arm64": "0.1.0",
+    "fig2r-win32-x64": "0.1.0"
   }
 }

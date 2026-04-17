@@ -2,3 +2,5 @@
 node_modules/
 npm-debug.log*
 CLAUDE.md
+npm-dist/
+*.tgz

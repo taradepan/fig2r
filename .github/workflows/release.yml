@@ -1,0 +1,175 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: detect version bump
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Compare package.json version
+        id: check
+        shell: bash
+        run: |
+          CURR=$(node -p "require('./package.json').version")
+          if git show HEAD~1:package.json >/dev/null 2>&1; then
+            PREV=$(git show HEAD~1:package.json \
+              | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).version))")
+          else
+            PREV=""
+          fi
+          echo "Current: $CURR  Previous: $PREV"
+          echo "version=$CURR" >> "$GITHUB_OUTPUT"
+          if [ "$CURR" != "$PREV" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Version unchanged — skipping release."
+          fi
+
+  build:
+    name: build ${{ matrix.name }}
+    needs: detect
+    if: needs.detect.outputs.publish == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: darwin-arm64
+            target: aarch64-apple-darwin
+            os: macos-14
+            node_os: darwin
+            node_arch: arm64
+          - name: darwin-x64
+            target: x86_64-apple-darwin
+            os: macos-13
+            node_os: darwin
+            node_arch: x64
+          - name: linux-x64
+            target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            node_os: linux
+            node_arch: x64
+          - name: linux-arm64
+            target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            node_os: linux
+            node_arch: arm64
+            use-cross: true
+          - name: win32-x64
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+            node_os: win32
+            node_arch: x64
+          - name: win32-arm64
+            target: aarch64-pc-windows-msvc
+            os: windows-latest
+            node_os: win32
+            node_arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (linux-arm64 only)
+        if: matrix.use-cross
+        run: cargo install cross --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.use-cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Assemble platform npm package
+        shell: bash
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          PKG_NAME: fig2r-${{ matrix.name }}
+          NODE_OS: ${{ matrix.node_os }}
+          NODE_ARCH: ${{ matrix.node_arch }}
+          TARGET: ${{ matrix.target }}
+          IS_WINDOWS: ${{ runner.os == 'Windows' }}
+          DIST_DIR: npm-dist/fig2r-${{ matrix.name }}
+        run: |
+          mkdir -p "$DIST_DIR/bin"
+          if [ "$IS_WINDOWS" = "true" ]; then
+            cp "target/$TARGET/release/fig2r.exe" "$DIST_DIR/bin/"
+          else
+            cp "target/$TARGET/release/fig2r" "$DIST_DIR/bin/"
+            chmod +x "$DIST_DIR/bin/fig2r"
+          fi
+          node -e "
+            const fs = require('fs');
+            const pkg = {
+              name: process.env.PKG_NAME,
+              version: process.env.VERSION,
+              description: 'Native binary for fig2r (' + process.env.NODE_OS + '-' + process.env.NODE_ARCH + ')',
+              license: 'MIT',
+              repository: { type: 'git', url: 'https://github.com/taradepan/fig2r' },
+              os: [process.env.NODE_OS],
+              cpu: [process.env.NODE_ARCH],
+              files: ['bin/']
+            };
+            fs.writeFileSync(process.env.DIST_DIR + '/package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Upload platform package
+        uses: actions/upload-artifact@v4
+        with:
+          name: fig2r-${{ matrix.name }}
+          path: npm-dist/fig2r-${{ matrix.name }}
+          retention-days: 1
+
+  publish:
+    name: npm publish
+    needs: [detect, build]
+    if: needs.detect.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download platform packages
+        uses: actions/download-artifact@v4
+        with:
+          path: npm-dist
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          for dir in npm-dist/fig2r-*; do
+            echo ">>> publishing $dir"
+            (cd "$dir" && npm publish --access public)
+          done
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
