@@ -20,11 +20,11 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "fig2r-darwin-arm64": "0.1.0",
-    "fig2r-darwin-x64": "0.1.0",
-    "fig2r-linux-arm64": "0.1.0",
-    "fig2r-linux-x64": "0.1.0",
-    "fig2r-win32-arm64": "0.1.0",
-    "fig2r-win32-x64": "0.1.0"
+    "@taradepan1313/fig2r-darwin-arm64": "0.1.0",
+    "@taradepan1313/fig2r-darwin-x64": "0.1.0",
+    "@taradepan1313/fig2r-linux-arm64": "0.1.0",
+    "@taradepan1313/fig2r-linux-x64": "0.1.0",
+    "@taradepan1313/fig2r-win32-arm64": "0.1.0",
+    "@taradepan1313/fig2r-win32-x64": "0.1.0"
   }
 }

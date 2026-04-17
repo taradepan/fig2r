@@ -98,7 +98,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.detect.outputs.version }}
-          PKG_NAME: fig2r-${{ matrix.name }}
+          PKG_NAME: "@taradepan1313/fig2r-${{ matrix.name }}"
           NODE_OS: ${{ matrix.node_os }}
           NODE_ARCH: ${{ matrix.node_arch }}
           TARGET: ${{ matrix.target }}

@@ -10,12 +10,12 @@ const path = require("node:path");
 const requireFromHere = createRequire(__filename);
 
 const PLATFORM_PACKAGES = {
-  "darwin-arm64": { target: "aarch64-apple-darwin", pkg: "fig2r-darwin-arm64" },
-  "darwin-x64":   { target: "x86_64-apple-darwin",  pkg: "fig2r-darwin-x64" },
-  "linux-arm64":  { target: "aarch64-unknown-linux-gnu", pkg: "fig2r-linux-arm64" },
-  "linux-x64":    { target: "x86_64-unknown-linux-gnu",  pkg: "fig2r-linux-x64" },
-  "win32-arm64":  { target: "aarch64-pc-windows-msvc", pkg: "fig2r-win32-arm64" },
-  "win32-x64":    { target: "x86_64-pc-windows-msvc",  pkg: "fig2r-win32-x64" },
+  "darwin-arm64": { target: "aarch64-apple-darwin", pkg: "@taradepan1313/fig2r-darwin-arm64" },
+  "darwin-x64":   { target: "x86_64-apple-darwin",  pkg: "@taradepan1313/fig2r-darwin-x64" },
+  "linux-arm64":  { target: "aarch64-unknown-linux-gnu", pkg: "@taradepan1313/fig2r-linux-arm64" },
+  "linux-x64":    { target: "x86_64-unknown-linux-gnu",  pkg: "@taradepan1313/fig2r-linux-x64" },
+  "win32-arm64":  { target: "aarch64-pc-windows-msvc", pkg: "@taradepan1313/fig2r-win32-arm64" },
+  "win32-x64":    { target: "x86_64-pc-windows-msvc",  pkg: "@taradepan1313/fig2r-win32-x64" },
 };
 
 const key = `${process.platform}-${process.arch}`;
