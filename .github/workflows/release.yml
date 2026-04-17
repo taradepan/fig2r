@@ -164,5 +164,19 @@ jobs:
             (cd "$dir" && npm publish --provenance --access public)
           done
 
+      - name: Sync optionalDependencies to main version
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            for (const k of Object.keys(pkg.optionalDependencies || {})) {
+              pkg.optionalDependencies[k] = process.env.VERSION;
+            }
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          cat package.json
+
       - name: Publish main package
         run: npm publish --provenance --access public
