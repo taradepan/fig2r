@@ -373,6 +373,21 @@ pub struct TextProps {
     pub text_align: Option<TextAlign>,
     #[serde(rename = "textDecoration")]
     pub text_decoration: Option<TextDecoration>,
+    #[serde(
+        rename = "textDecorationStyle",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub text_decoration_style: Option<TextDecorationStyle>,
+    #[serde(
+        rename = "textDecorationOffset",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub text_decoration_offset: Option<f64>,
+    #[serde(
+        rename = "textDecorationThickness",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub text_decoration_thickness: Option<f64>,
     #[serde(rename = "textTransform")]
     pub text_transform: Option<TextTransform>,
     pub truncation: Option<Truncation>,
@@ -445,6 +460,16 @@ pub enum TextDecoration {
     None,
     Underline,
     Strikethrough,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TextDecorationStyle {
+    Solid,
+    Double,
+    Dotted,
+    Dashed,
+    Wavy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

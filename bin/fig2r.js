@@ -3,8 +3,10 @@
 // optionalDependencies and exec the bundled binary.
 
 const { spawn } = require("node:child_process");
-const { chmodSync, existsSync, statSync } = require("node:fs");
+const { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } = require("node:fs");
 const { createRequire } = require("node:module");
+const https = require("node:https");
+const os = require("node:os");
 const path = require("node:path");
 
 const requireFromHere = createRequire(__filename);
@@ -57,6 +59,8 @@ if (process.platform !== "win32") {
   } catch { /* best-effort */ }
 }
 
+maybeCheckForUpdate();
+
 const child = spawn(binaryPath, process.argv.slice(2), { stdio: "inherit" });
 
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
@@ -74,3 +78,60 @@ child.on("exit", (code, signal) => {
   if (signal) process.kill(process.pid, signal);
   else process.exit(code ?? 1);
 });
+
+// Update notifier: prints a notice when a newer fig2r is on npm.
+// Reads cached result synchronously (fast); fires a background fetch at most
+// once every 24h to refresh the cache. Non-blocking — never delays the CLI.
+// Disable via NO_UPDATE_NOTIFIER=1 or when CI is set.
+function maybeCheckForUpdate() {
+  if (process.env.CI || process.env.NO_UPDATE_NOTIFIER) return;
+
+  const cacheFile = path.join(os.homedir(), ".fig2r", "update-check.json");
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+  const pkgJson = requireFromHere("../package.json");
+  const current = pkgJson.version;
+
+  let cache = {};
+  try { cache = JSON.parse(readFileSync(cacheFile, "utf8")); } catch { /* no cache yet */ }
+
+  if (cache.latest && isNewer(cache.latest, current)) {
+    process.stderr.write(
+      `\n[fig2r] Update available: ${current} → ${cache.latest}\n` +
+      `        Run: npm install -g fig2r@latest\n\n`
+    );
+  }
+
+  if (Date.now() - (cache.checkedAt || 0) < ONE_DAY) return;
+
+  const req = https.get(
+    `https://registry.npmjs.org/${pkgJson.name}/latest`,
+    { timeout: 3000, headers: { accept: "application/json" } },
+    (res) => {
+      if (res.statusCode !== 200) { res.resume(); return; }
+      let body = "";
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => {
+        try {
+          const latest = JSON.parse(body).version;
+          if (typeof latest !== "string") return;
+          mkdirSync(path.dirname(cacheFile), { recursive: true });
+          writeFileSync(cacheFile, JSON.stringify({ latest, checkedAt: Date.now() }));
+        } catch { /* best-effort */ }
+      });
+    }
+  );
+  req.on("error", () => { /* offline or registry hiccup — ignore */ });
+  req.on("timeout", () => req.destroy());
+  req.on("socket", (s) => s.unref());
+}
+
+// Lightweight semver >: compares x.y.z only, ignores pre-release tags.
+function isNewer(a, b) {
+  const pa = String(a).split("-")[0].split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = String(b).split("-")[0].split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return true;
+    if ((pa[i] || 0) < (pb[i] || 0)) return false;
+  }
+  return false;
+}

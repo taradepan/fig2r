@@ -1,110 +1,76 @@
 # fig2r
 
-One-shot Figma → pixel-perfect React + Tailwind, built for AI coding agents (Claude Code, Cursor, Codex, etc.).
+> Figma → pixel-perfect React + Tailwind, from your terminal. Built for AI coding agents.
 
-Point your agent at a Figma node URL. fig2r fetches the design, downloads every asset, and writes React components you can drop into a Next.js / Vite / Remix project. The output is an adaptable reference — your agent can then rewire it to your design system, tokens, and components.
+[![npm](https://img.shields.io/npm/v/fig2r.svg)](https://www.npmjs.com/package/fig2r)
+[![downloads](https://img.shields.io/npm/dm/fig2r.svg)](https://www.npmjs.com/package/fig2r)
+[![license](https://img.shields.io/npm/l/fig2r.svg)](./LICENSE)
+
+Point fig2r at a Figma node URL. It fetches the design, downloads every asset, and writes idiomatic React + Tailwind components you — or your agent — can drop into Next.js, Vite, or Remix.
+
+The output is a **reference**, not a final component. Your agent then rewires it to match your project's design system, tokens, and components.
 
 ## Install
 
 ```bash
 npm install -g fig2r
-# or: cargo install --path .
 ```
 
-First run needs a Figma token (`file_content:read` scope):
+Set a Figma token (scope `file_content:read`):
 
 ```bash
-fig2r auth figd_xxx   # stored in ~/.fig2r/config.toml, chmod 0600
+fig2r auth figd_xxxxxxxxxxxx
 # or: export FIGMA_TOKEN=figd_xxx
-# or: --token figd_xxx
 ```
 
-## Usage
+## Quick start
 
 ```bash
-# Fetch + generate components + download assets in one step
-fig2r fetch "https://www.figma.com/design/FILE/Name?node-id=123-456" --save ./components
-
-# Stream IR JSON to stdout (pipe into an agent or another tool)
-fig2r fetch "https://..." > design.ir.json
-
-# Convert an existing IR JSON to components
-fig2r convert design.ir.json -o ./components
-cat design.ir.json | fig2r convert -o ./components
-
-# Validate IR without writing files
-fig2r validate design.ir.json
+fig2r fetch "https://www.figma.com/design/FILE/Name?node-id=123-456" \
+  --save ./components \
+  --public-dir ./public
 ```
 
-Common flags (`fig2r fetch --help` for all):
+That's it. Open `./components/` — `.tsx` files ready to import.
 
-| Flag | Purpose |
-|---|---|
-| `--save <dir>` | Write component files instead of printing IR |
-| `--public-dir <dir>` | Route image assets to `<dir>/assets/` (Next.js `/public`) |
-| `--svg-mode` | `react-component` (default), `file`, or `inline` |
-| `--naming` | `pascal` or `kebab` component names |
-| `--no-theme` | Skip theme token extraction |
-| `--strict` | Fail on any unsupported construct (CI mode) |
+## Commands
 
-## Agent workflow
-
-The primary use case is an LLM-driven loop:
-
-1. Agent gets a Figma URL from the user.
-2. Agent runs `fig2r fetch <url> --save <tmp>`.
-3. Agent reads the generated React + Tailwind as a reference.
-4. Agent adapts it to the target project's components, tokens, and conventions.
-
-The emitted code is deliberately concrete (arbitrary Tailwind values like `px-[13px]`, literal hex) so the agent sees the exact design intent and can decide what to keep vs. replace with tokens.
-
-## Output
-
-```
-components/
-  Container/
-    Container.tsx       # React component
-    index.ts            # re-export
-  icons/                # SVG vectors as React components
-  theme.ts              # design tokens (optional)
-public/assets/          # PNG/JPG/SVG image fills
+```bash
+fig2r fetch <url> --save <dir>   # Figma → components + assets
+fig2r fetch <url>                # stream IR JSON to stdout
+fig2r convert <ir.json> -o <dir> # IR JSON → components (offline)
+fig2r validate <ir.json>         # schema check
+fig2r auth <token>               # save token to ~/.fig2r/config.toml
 ```
 
-Fonts: `next/font/google` imports are emitted with `variable: '--font-xxx'` and wired to descendants via a `display: contents` wrapper so the mangled family name resolves correctly.
+Useful flags: `--public-dir`, `--svg-mode {react-component|file|inline}`, `--naming {pascal|kebab}`, `--no-theme`. `convert` also accepts `--strict` (fail on any unsupported construct, for CI). See `fig2r <cmd> --help`.
 
-## Architecture
+## Agent skill (auto-linked)
 
-Thin `main.rs` parses CLI args and dispatches. Pipeline:
+On install, fig2r symlinks a bundled skill into any agent skill directory it finds:
 
-**Figma REST API → IR JSON → codegen tree → emitted files**
+- `~/.claude/skills/fig2r` — Claude Code
+- `~/.agents/skills/fig2r` — Cursor, Codex, Aider, Cline
 
-| Module | Role |
-|---|---|
-| `cli` | clap derive subcommands |
-| `figma` | API client, URL parser, token config, node → IR transform |
-| `ir` | IR schema (`serde`) + validation |
-| `codegen` | IR → component tree, assets, theme tokens, variants |
-| `tailwind` | IR → Tailwind class strings |
-| `emit` | file writer + formatter |
+Your agent reads the skill and knows the whole workflow: fetch into `/tmp`, read the reference, adapt to the target project (shadcn, Radix, custom tokens, `next/font`, etc.), dedupe assets, verify.
 
-IR JSON is stable across runs and versioned, so agents can cache it or pipe it between tools.
+Opt out with `FIG2R_SKIP_SKILL_INSTALL=1 npm install -g fig2r`. Uninstall with `rm ~/.claude/skills/fig2r ~/.agents/skills/fig2r`.
 
-## What fig2r handles
+## What it handles
 
-Layout (flex + grid), auto-layout, absolute positioning, z-index, padding/gap, per-side borders, rounded corners (including iOS squircle fallback), solid/gradient/image fills, drop + inner shadows, blur, blend modes, opacity, rotation, flip, aspect ratio, fixed/fill/hug sizing, min/max constraints, variants, component properties, images (cover/contain/crop), SVG paths, rich text spans, font-family + weight + line-height + letter-spacing + decoration + list bullets + OpenType features.
+Flex + grid auto-layout, absolute positioning, z-index, padding/gap, per-side borders, rounded corners, solid/gradient/image fills, drop + inner shadows, blur, blend modes, opacity, rotation, flip, aspect ratio, variants, component properties, rich text, OpenType features, `next/font/google`, SVG paths, parallel asset download.
 
 ## Known limits
 
-- Vector paths from `strokeGeometry` aren't rendered (use `fillGeometry` only).
-- Per-paint `blendMode` and `imageTransform` (crop pan position) aren't honored — node-level blend + `scaleMode` cover the common cases.
-- Figma Variables are flattened to their resolved color; mode switching isn't round-tripped.
-- `strokesIncludedInLayout` isn't translated to box-sizing offsets.
-
-## Requirements
-
-- Node 18+ (for the npm shim)
-- Rust edition 2024 if building from source
+- `strokeGeometry` paths not rendered (use `fillGeometry`)
+- Per-paint `blendMode` / `imageTransform` not honored
+- Figma Variables flattened to resolved colors — mode switching not round-tripped
+- Bullet/numbered text lists render as `<span>•</span>` + text, not semantic `<ul>/<ol>/<li>`
+- `paragraphSpacing` emits a warning instead of wrapping paragraphs in `<p>` tags
+- Gradient strokes fall back to the first stop's solid color; conic (`GRADIENT_ANGULAR`) approximated as linear
+- Image fill filters (exposure/contrast/saturation) not applied in CSS
+- React-only (no Vue / Svelte / SwiftUI)
 
 ## License
 
-MIT
+[MIT](./LICENSE) © Taradepan R

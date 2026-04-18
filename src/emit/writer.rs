@@ -1,9 +1,13 @@
 use crate::codegen::tree::OutputFile;
+use rayon::prelude::*;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub fn write_files(base: &Path, files: &[OutputFile]) -> io::Result<()> {
+    // Validate first (cheap, serial) so a traversal attempt fails before we touch disk.
     for file in files {
         if file.path.contains("..") {
             return Err(io::Error::new(
@@ -11,17 +15,30 @@ pub fn write_files(base: &Path, files: &[OutputFile]) -> io::Result<()> {
                 format!("path traversal rejected: {}", file.path),
             ));
         }
+    }
+
+    // Pre-create parent directories once each. `fs::create_dir_all` is technically
+    // concurrent-safe, but calling it N times wastes syscalls on the common parent.
+    let created: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
+    for file in files {
         let full_path = base.join(&file.path);
         if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent)?;
+            let mut set = created.lock().unwrap();
+            if set.insert(parent.to_path_buf()) {
+                fs::create_dir_all(parent)?;
+            }
         }
+    }
+
+    files.par_iter().try_for_each(|file| -> io::Result<()> {
+        let full_path = base.join(&file.path);
         if let Some(ref bytes) = file.binary {
             fs::write(&full_path, bytes)?;
         } else {
             fs::write(&full_path, &file.content)?;
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]

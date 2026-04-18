@@ -72,15 +72,25 @@ pub struct FigmaNode {
     pub max_height: Option<f64>,
     #[serde(rename = "layoutAlign")]
     pub layout_align: Option<String>,
+    #[serde(rename = "layoutGrow")]
+    pub layout_grow: Option<f64>,
     #[serde(rename = "overflowDirection")]
     pub overflow_direction: Option<String>,
     #[serde(rename = "gridRowGap")]
     pub grid_row_gap: Option<f64>,
     #[serde(rename = "gridColumnGap")]
     pub grid_column_gap: Option<f64>,
-    #[serde(rename = "gridColumnsSizing", default, deserialize_with = "de_grid_sizing")]
+    #[serde(
+        rename = "gridColumnsSizing",
+        default,
+        deserialize_with = "de_grid_sizing"
+    )]
     pub grid_columns_sizing: Option<Vec<String>>,
-    #[serde(rename = "gridRowsSizing", default, deserialize_with = "de_grid_sizing")]
+    #[serde(
+        rename = "gridRowsSizing",
+        default,
+        deserialize_with = "de_grid_sizing"
+    )]
     pub grid_rows_sizing: Option<Vec<String>>,
     #[serde(rename = "gridColumnSpan")]
     pub grid_column_span: Option<u32>,
@@ -259,12 +269,22 @@ pub struct FigmaTypeStyle {
     pub font_size: Option<f64>,
     #[serde(rename = "lineHeightPx")]
     pub line_height_px: Option<f64>,
+    #[serde(rename = "lineHeightPercentFontSize")]
+    pub line_height_percent_font_size: Option<f64>,
+    #[serde(rename = "lineHeightUnit")]
+    pub line_height_unit: Option<String>,
     #[serde(rename = "letterSpacing")]
     pub letter_spacing: Option<f64>,
     #[serde(rename = "textAlignHorizontal")]
     pub text_align_horizontal: Option<String>,
     #[serde(rename = "textDecoration")]
     pub text_decoration: Option<String>,
+    #[serde(rename = "textDecorationStyle")]
+    pub text_decoration_style: Option<String>,
+    #[serde(rename = "textDecorationOffset")]
+    pub text_decoration_offset: Option<f64>,
+    #[serde(rename = "textDecorationThickness")]
+    pub text_decoration_thickness: Option<f64>,
     #[serde(rename = "textCase")]
     pub text_case: Option<String>,
     #[serde(rename = "textTruncation")]

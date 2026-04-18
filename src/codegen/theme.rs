@@ -81,7 +81,7 @@ pub fn generate_tokens_ts(theme: &Theme) -> String {
 
 fn format_string_map(map: &HashMap<String, String>) -> String {
     let mut entries: Vec<_> = map.iter().collect();
-    entries.sort_by_key(|(k, _)| (*k).clone());
+    entries.sort_by(|a, b| a.0.cmp(b.0));
     let items: Vec<String> = entries
         .iter()
         .map(|(k, v)| {
@@ -97,7 +97,7 @@ fn format_string_map(map: &HashMap<String, String>) -> String {
 
 fn format_font_family_map(map: &HashMap<String, String>) -> String {
     let mut entries: Vec<_> = map.iter().collect();
-    entries.sort_by_key(|(k, _)| (*k).clone());
+    entries.sort_by(|a, b| a.0.cmp(b.0));
     let items: Vec<String> = entries
         .iter()
         .map(|(k, v)| format!("    {k}: ['{v}', 'sans-serif']"))
@@ -107,7 +107,7 @@ fn format_font_family_map(map: &HashMap<String, String>) -> String {
 
 fn format_number_map(map: &HashMap<String, f64>) -> String {
     let mut entries: Vec<_> = map.iter().collect();
-    entries.sort_by_key(|(k, _)| (*k).clone());
+    entries.sort_by(|a, b| a.0.cmp(b.0));
     let items: Vec<String> = entries
         .iter()
         .map(|(k, v)| format!("    {k}: {v}"))
@@ -117,7 +117,7 @@ fn format_number_map(map: &HashMap<String, f64>) -> String {
 
 fn format_ts_string_map(map: &HashMap<String, String>) -> String {
     let mut entries: Vec<_> = map.iter().collect();
-    entries.sort_by_key(|(k, _)| (*k).clone());
+    entries.sort_by(|a, b| a.0.cmp(b.0));
     let items: Vec<String> = entries
         .iter()
         .map(|(k, v)| {
@@ -133,7 +133,7 @@ fn format_ts_string_map(map: &HashMap<String, String>) -> String {
 
 fn format_ts_number_map(map: &HashMap<String, f64>) -> String {
     let mut entries: Vec<_> = map.iter().collect();
-    entries.sort_by_key(|(k, _)| (*k).clone());
+    entries.sort_by(|a, b| a.0.cmp(b.0));
     let items: Vec<String> = entries.iter().map(|(k, v)| format!("  {k}: {v}")).collect();
     format!("{{\n{}\n}}", items.join(",\n"))
 }

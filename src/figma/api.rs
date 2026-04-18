@@ -1,7 +1,14 @@
 use crate::error::Fig2rError;
 use crate::figma::types::{FileNodesResponse, ImageResponse};
+use futures::stream::{self, StreamExt};
 
 const BASE_URL: &str = "https://api.figma.com/v1";
+
+/// Maximum number of concurrent image downloads.
+///
+/// Unbounded parallelism caused connection-setup failures (TLS handshake
+/// storm, ephemeral port / FD pressure) on designs with many assets.
+const MAX_CONCURRENT_DOWNLOADS: usize = 16;
 
 pub struct FigmaClient {
     token: String,
@@ -51,8 +58,10 @@ impl FigmaClient {
             None => format!("{}/files/{file_key}", self.base_url),
         };
 
-        let body = self.get_json(&url).await?;
-        serde_json::from_str(&body)
+        self.get_authed(&url)
+            .await?
+            .json::<FileNodesResponse>()
+            .await
             .map_err(|e| Fig2rError::Message(format!("Failed to parse Figma response: {e}")))
     }
 
@@ -70,54 +79,41 @@ impl FigmaClient {
             self.base_url
         );
 
-        let body = self.get_json(&url).await?;
-        serde_json::from_str(&body)
+        self.get_authed(&url)
+            .await?
+            .json::<ImageResponse>()
+            .await
             .map_err(|e| Fig2rError::Message(format!("Failed to parse image response: {e}")))
     }
 
-    /// Download multiple images concurrently using tokio tasks.
+    /// Download multiple images concurrently, capped at
+    /// `MAX_CONCURRENT_DOWNLOADS` in-flight requests.
+    ///
+    /// A failed download still yields a `DownloadResult` with `data: Err(_)`.
     pub async fn download_images_parallel(
         &self,
         items: &[(String, String)],
     ) -> Vec<DownloadResult> {
-        let mut handles = Vec::with_capacity(items.len());
-
-        for (id, url) in items {
-            let client = self.client.clone();
-            let id = id.clone();
-            let url = url.clone();
-            handles.push(tokio::spawn(async move {
-                let data = download_url(&client, &url).await;
-                DownloadResult { id, url, data }
-            }));
-        }
-
-        let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
-            match handle.await {
-                Ok(result) => results.push(result),
-                Err(e) => {
-                    results.push(DownloadResult {
-                        id: String::new(),
-                        url: String::new(),
-                        data: Err(Fig2rError::Message(format!("Task panicked: {e}"))),
-                    });
+        stream::iter(items.iter().cloned())
+            .map(|(id, url)| {
+                let client = self.client.clone();
+                async move {
+                    let data = download_url(&client, &url).await;
+                    DownloadResult { id, url, data }
                 }
-            }
-        }
-        results
+            })
+            .buffer_unordered(MAX_CONCURRENT_DOWNLOADS)
+            .collect::<Vec<_>>()
+            .await
     }
 
-    async fn get_json(&self, url: &str) -> Result<String, Fig2rError> {
+    async fn get_authed(&self, url: &str) -> Result<reqwest::Response, Fig2rError> {
         self.client
             .get(url)
             .header("X-Figma-Token", &self.token)
             .send()
             .await
-            .map_err(|e| Fig2rError::Message(format!("Figma API failed: {e}")))?
-            .text()
-            .await
-            .map_err(|e| Fig2rError::Message(format!("Failed to read response: {e}")))
+            .map_err(|e| Fig2rError::Message(format!("Figma API failed: {e}")))
     }
 }
 

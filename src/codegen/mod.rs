@@ -1,5 +1,6 @@
 pub mod asset;
 pub mod component;
+pub mod fonts;
 pub mod index;
 pub mod theme;
 pub mod tree;

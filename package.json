@@ -1,6 +1,6 @@
 {
   "name": "fig2r",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Convert Figma designs to pixel-perfect React + Tailwind components",
   "license": "MIT",
   "author": "Taradepan R",
@@ -13,8 +13,13 @@
   "bin": {
     "fig2r": "bin/fig2r.js"
   },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
   "files": [
-    "bin/"
+    "bin/",
+    "scripts/",
+    "skills/"
   ],
   "engines": {
     "node": ">=18"

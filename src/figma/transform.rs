@@ -3,9 +3,10 @@ use crate::ir::schema::{
     Alignment, Asset, AssetType, BlendMode, BorderRadius, ComponentInfo, DesignIR, Dimension,
     DimensionType, Effect, Fill, GradientStop, GradientType, Layout, LayoutMode, ListType, Mask,
     MaskType, Node, NodeType, Overflow, Padding, Position, ScaleMode, Stroke, StrokePosition,
-    Style, TextAlign, TextDecoration, TextProps, TextSpan, TextTransform, Truncation,
-    VerticalAlign,
+    Style, TextAlign, TextDecoration, TextDecorationStyle, TextProps, TextSpan, TextTransform,
+    Truncation, VerticalAlign,
 };
+use rustc_hash::FxHashSet;
 use std::collections::HashMap;
 
 /// Round a pixel value to the nearest 0.5px.
@@ -179,7 +180,39 @@ fn build_text_spans(
 /// Entry point: convert a top-level Figma node into a DesignIR.
 pub fn figma_to_ir(name: &str, figma_node: &FigmaNode) -> DesignIR {
     let mut assets = Vec::new();
-    let root = transform_node_inner(figma_node, &mut assets, false, None, None);
+    let mut asset_ids: FxHashSet<String> = FxHashSet::default();
+    let mut root = transform_node_inner(figma_node, &mut assets, &mut asset_ids, false, None, None);
+    // The root node has no parent to fill when rendered standalone, so `FILL`
+    // sizing would collapse to browser defaults (100% viewport). Force the
+    // root to fixed pixel dimensions taken from Figma's bounding box.
+    //
+    // We also force `overflow: hidden` on the root. Rationale: in Figma's
+    // canvas, anything extending past the frame you're capturing is clipped by
+    // an ancestor (another frame, the page, etc.). When users extract a
+    // subtree to code, they expect the render to match Figma's canvas view —
+    // i.e. clipped to the frame's bbox. Without this, absolutely-positioned
+    // descendants that extend past the node (common for floating popovers,
+    // decorative mascots, speech-bubble overflows) render in empty page space
+    // instead of being clipped, making the output look visually different
+    // from Figma. This matches the designer's authored intent for isolated
+    // rendering.
+    if let (Some(layout), Some(bb)) = (root.layout.as_mut(), figma_node.absolute_bounding_box.as_ref()) {
+        if layout.width.as_ref().map(|d| &d.dim_type) != Some(&DimensionType::Fixed) {
+            layout.width = Some(Dimension {
+                dim_type: DimensionType::Fixed,
+                value: Some(round_half_px(bb.width)),
+            });
+        }
+        if layout.height.as_ref().map(|d| &d.dim_type) != Some(&DimensionType::Fixed) {
+            layout.height = Some(Dimension {
+                dim_type: DimensionType::Fixed,
+                value: Some(round_half_px(bb.height)),
+            });
+        }
+        if layout.overflow.is_none() {
+            layout.overflow = Some(Overflow::Hidden);
+        }
+    }
     DesignIR {
         version: "1.0".into(),
         name: name.into(),
@@ -192,6 +225,7 @@ pub fn figma_to_ir(name: &str, figma_node: &FigmaNode) -> DesignIR {
 fn transform_node_inner(
     figma: &FigmaNode,
     assets: &mut Vec<Asset>,
+    asset_ids: &mut FxHashSet<String>,
     is_overlay: bool,
     parent_layout_mode: Option<&LayoutMode>,
     parent_bb: Option<&BoundingBox>,
@@ -216,7 +250,7 @@ fn transform_node_inner(
 
     // Build children (filter hidden, skip masks)
     let parent_has_no_layout = !has_auto_layout;
-    let children: Vec<Node> = figma
+    let mut children: Vec<Node> = figma
         .children
         .iter()
         .filter(|c| c.visible.unwrap_or(true))
@@ -227,11 +261,15 @@ fn transform_node_inner(
             let mut child = transform_node_inner(
                 c,
                 assets,
+                asset_ids,
                 child_is_overlay,
                 my_layout_mode.as_ref(),
                 figma.absolute_bounding_box.as_ref(),
             );
-            // Set z-index for absolute children in no-layout parents
+            // Figma children are ordered bottom-first for SAME-CATEGORY siblings
+            // (last in-array painted on top). We handle flex-vs-absolute
+            // visibility below via DOM reordering, so explicit z-index here is
+            // only needed when parent has no auto-layout at all.
             if parent_has_no_layout
                 && figma.absolute_bounding_box.is_some()
                 && let Some(ref mut layout) = child.layout
@@ -242,15 +280,33 @@ fn transform_node_inner(
             child
         })
         .collect();
+    // Figma's canvas renders flex-flow children ON TOP of absolutely-positioned
+    // siblings (the absolutes form a "decorative background layer" regardless
+    // of their position in the children array). In CSS, later DOM order wins
+    // for same-stacking-context positioned elements — so we emit absolute
+    // children FIRST and flex children LAST. This preserves Figma's visual
+    // stacking and keeps flex spatial layout intact because absolute children
+    // are out-of-flow anyway. Stable-partition to preserve relative order
+    // within each category.
+    if has_auto_layout {
+        let (absolute_children, flex_children): (Vec<Node>, Vec<Node>) =
+            children.into_iter().partition(|c| {
+                c.layout
+                    .as_ref()
+                    .is_some_and(|l| l.position.is_some())
+            });
+        children = absolute_children;
+        children.extend(flex_children);
+    }
 
     // Text node
     if node_type == NodeType::Text {
-        return make_text_node(figma, assets, parent_layout_mode, parent_bb);
+        return make_text_node(figma, assets, asset_ids, parent_layout_mode, parent_bb);
     }
 
     // Image node (has image fill)
     if node_type == NodeType::Image {
-        return make_image_node(figma, assets, parent_layout_mode, parent_bb);
+        return make_image_node(figma, assets, asset_ids, parent_layout_mode, parent_bb);
     }
 
     // Wrapper flattening: single-child frame where child is not text
@@ -262,20 +318,44 @@ fn transform_node_inner(
         && figma.effects.is_empty()
     {
         let mut child = children.into_iter().next().unwrap();
-        // Transfer wrapper's absolute position to child if child doesn't have one
         let wrapper_layout = build_layout(figma, parent_layout_mode, parent_bb);
-        if let Some(ref wpos) = wrapper_layout.position
-            && let Some(ref mut cl) = child.layout
-            && (cl.position.is_none()
-                || cl
-                    .position
-                    .as_ref()
-                    .is_some_and(|p| p.x.abs() < 0.01 && p.y.abs() < 0.01))
-        {
-            cl.position = Some(Position {
-                x: wpos.x,
-                y: wpos.y,
-            });
+        // After flattening, the child moves up one level — its original
+        // `position` was relative to the now-gone wrapper's coordinate space.
+        // Two cases:
+        //   1. Wrapper had its own absolute position (e.g. wrapper is an
+        //      absolute frame in a no-layout parent) → transfer the wrapper's
+        //      position onto the child so it retains its place.
+        //   2. Wrapper was in flex flow (no position) → the child should also
+        //      participate in flex flow at the grandparent; its internal
+        //      position is stale and would mis-anchor it. Drop it.
+        if let Some(ref mut cl) = child.layout {
+            // The child's `position` was computed relative to the wrapper's
+            // coordinate space (from `build_layout`'s `is_absolute` branch).
+            // After flattening, the child becomes a direct descendant of the
+            // grandparent, so its position must become wrapper+child to stay
+            // visually correct. If the wrapper has no own position (it was in
+            // flex flow), clear the child's position so it flows naturally.
+            match (wrapper_layout.position.as_ref(), cl.position.as_ref()) {
+                (Some(wpos), Some(cpos)) => {
+                    cl.position = Some(Position {
+                        x: wpos.x + cpos.x,
+                        y: wpos.y + cpos.y,
+                    });
+                }
+                (Some(wpos), None) => {
+                    cl.position = Some(Position {
+                        x: wpos.x,
+                        y: wpos.y,
+                    });
+                }
+                (None, _) => {
+                    cl.position = None;
+                }
+            }
+            // z_index was assigned by the wrapper's child-loop for stacking
+            // within the (now-flattened) wrapper. It has no meaning in the
+            // grandparent's stacking context. Clear it unconditionally.
+            cl.z_index = None;
         }
         child.overlay = child.overlay || is_overlay;
         return child;
@@ -297,17 +377,25 @@ fn transform_node_inner(
     // Icon container: recursively checks if all visible children are vectors/booleans
     // Export as a single SVG image.
     if is_icon_container(figma) && !children.is_empty() {
-        assets.push(Asset {
-            id: figma.id.clone(),
-            name: figma.name.clone(),
-            asset_type: AssetType::Svg,
-            format: "svg".into(),
-            data: String::new(),
-            url: None,
-            source_ref: None,
-        });
-        let layout = build_layout(figma, parent_layout_mode, parent_bb);
-        let style = build_style(figma, assets);
+        if asset_ids.insert(figma.id.clone()) {
+            assets.push(Asset {
+                id: figma.id.clone(),
+                name: figma.name.clone(),
+                asset_type: AssetType::Svg,
+                format: "svg".into(),
+                data: String::new(),
+                url: None,
+                source_ref: None,
+            });
+        }
+        // We're stripping the frame's children and rendering it as a single
+        // SVG image. `build_layout` still sees the original children and won't
+        // bbox-promote Hug dims for us (it treats the node as a non-leaf
+        // auto-layout frame). Force the promotion here so the rendered `<img>`
+        // / `<IconX>` has an intrinsic size.
+        let mut layout = build_layout(figma, parent_layout_mode, parent_bb);
+        promote_hug_to_bbox(&mut layout, figma);
+        let style = build_style(figma, assets, asset_ids);
         return Node {
             id: figma.id.clone(),
             name: figma.name.clone(),
@@ -326,7 +414,7 @@ fn transform_node_inner(
     }
 
     let layout = build_layout(figma, parent_layout_mode, parent_bb);
-    let style = build_style(figma, assets);
+    let style = build_style(figma, assets, asset_ids);
 
     Node {
         id: figma.id.clone(),
@@ -375,6 +463,34 @@ fn has_image_fill(figma: &FigmaNode) -> bool {
         .any(|f| f.visible && f.paint_type == "IMAGE")
 }
 
+/// Force Hug-sized dimensions to concrete pixel values from the Figma absolute
+/// bounding box. Used by the image/icon-container render paths after
+/// `build_layout`, where those nodes are collapsed to leaves but
+/// `build_layout` was working with their original auto-layout frame structure.
+fn promote_hug_to_bbox(layout: &mut Layout, figma: &FigmaNode) {
+    let Some(bb) = figma.absolute_bounding_box.as_ref() else {
+        return;
+    };
+    if matches!(
+        layout.width.as_ref().map(|d| &d.dim_type),
+        Some(DimensionType::Hug)
+    ) {
+        layout.width = Some(Dimension {
+            dim_type: DimensionType::Fixed,
+            value: Some(round_half_px(bb.width)),
+        });
+    }
+    if matches!(
+        layout.height.as_ref().map(|d| &d.dim_type),
+        Some(DimensionType::Hug)
+    ) {
+        layout.height = Some(Dimension {
+            dim_type: DimensionType::Fixed,
+            value: Some(round_half_px(bb.height)),
+        });
+    }
+}
+
 fn build_layout(
     figma: &FigmaNode,
     parent_flex_dir: Option<&LayoutMode>,
@@ -416,6 +532,33 @@ fn build_layout(
         None
     };
 
+    // Leaf detection: no visible children. Nodes that hug their content but have
+    // no content will collapse to 0 / stretch to 100% in the browser, so we
+    // promote their Hug dim to a concrete pixel size from the bounding box.
+    let is_leaf = figma
+        .children
+        .iter()
+        .filter(|c| c.visible.unwrap_or(true))
+        .count()
+        == 0;
+    // Intrinsic-sized Figma types: size comes from their geometry bounding box.
+    let is_intrinsic_type = matches!(
+        figma.node_type.as_str(),
+        "VECTOR" | "LINE" | "REGULAR_POLYGON" | "STAR" | "ELLIPSE" | "BOOLEAN_OPERATION"
+    );
+    // Text is sized by content and `layoutSizingHorizontal/Vertical`. Bbox-forcing
+    // text triggers a `flex-col justify-center` wrapper in `render_text_node` and
+    // risks clipping when the browser's font metrics differ from Figma's — keep
+    // text content-sized instead. Since text nodes are always leaves in the IR
+    // sense, `is_leaf` alone would re-enable promotion, so guard explicitly.
+    let is_text = figma.node_type.as_str() == "TEXT";
+    // Auto-layout frames size themselves from their children — skip promotion
+    // for those. But a childless auto-layout frame has nothing to size from
+    // (common when Figma classifies a node as an image/group with nested art),
+    // so leaves always get bbox-promoted regardless of layoutMode.
+    let should_promote_hug =
+        !is_text && (is_leaf || (is_intrinsic_type && !has_auto_layout));
+
     // Dimensions
     let (width, height) = {
         let w = figma.layout_sizing_horizontal.as_deref().map(|s| match s {
@@ -454,7 +597,7 @@ fn build_layout(
         });
         // Absolute nodes: FILL sizing doesn't apply (no parent layout to fill).
         // Fall back to bounding box for FILL or missing sizing.
-        if is_absolute {
+        let (w, h) = if is_absolute {
             let bb_w = || {
                 figma.absolute_bounding_box.as_ref().map(|bb| Dimension {
                     dim_type: DimensionType::Fixed,
@@ -478,11 +621,71 @@ fn build_layout(
             (w, h)
         } else {
             (w, h)
+        };
+
+        // Promote Hug → Fixed(bb) for leaves / intrinsic types. Without this,
+        // Tailwind emits no width/height class and the element stretches to 100%
+        // of its parent (icons become 300px black blobs).
+        let promote = |dim: Option<Dimension>, bb_value: Option<f64>| -> Option<Dimension> {
+            match dim {
+                Some(Dimension {
+                    dim_type: DimensionType::Hug,
+                    value: None,
+                }) if should_promote_hug => bb_value.map(|v| Dimension {
+                    dim_type: DimensionType::Fixed,
+                    value: Some(round_half_px(v)),
+                }),
+                other => other,
+            }
+        };
+        let bb_w = figma.absolute_bounding_box.as_ref().map(|bb| bb.width);
+        let bb_h = figma.absolute_bounding_box.as_ref().map(|bb| bb.height);
+        let w = promote(w, bb_w);
+        let h = promote(h, bb_h);
+
+        // layoutGrow == 1 means "fill parent's main axis". HORIZONTAL parent →
+        // width is main axis; VERTICAL parent → height. Overrides layoutSizing*.
+        if figma.layout_grow == Some(1.0) {
+            match parent_flex_dir {
+                Some(LayoutMode::Horizontal) => (
+                    Some(Dimension {
+                        dim_type: DimensionType::Fill,
+                        value: None,
+                    }),
+                    h,
+                ),
+                Some(LayoutMode::Vertical) => (
+                    w,
+                    Some(Dimension {
+                        dim_type: DimensionType::Fill,
+                        value: None,
+                    }),
+                ),
+                _ => (w, h),
+            }
+        } else {
+            (w, h)
         }
     };
 
     // Padding
-    let padding = if has_auto_layout {
+    //
+    // Thin childless dividers: Figma lets you author a 1-2px "line" frame WITH
+    // padding around it. The padding is ignored in Figma's renderer because
+    // the fixed height takes precedence, but in CSS padding expands the
+    // element into a thick colored strip (e.g. `h-[1px] py-[12px]` becomes
+    // 25px tall when box-sizing quirks bite). Drop the padding in that case.
+    let is_thin_divider = figma
+        .children
+        .iter()
+        .filter(|c| c.visible.unwrap_or(true))
+        .count()
+        == 0
+        && figma
+            .absolute_bounding_box
+            .as_ref()
+            .is_some_and(|bb| bb.height <= 2.0 || bb.width <= 2.0);
+    let padding = if has_auto_layout && !is_thin_divider {
         let pt = round_half_px(figma.padding_top.unwrap_or(0.0));
         let pr = round_half_px(figma.padding_right.unwrap_or(0.0));
         let pb = round_half_px(figma.padding_bottom.unwrap_or(0.0));
@@ -513,42 +716,93 @@ fn build_layout(
         .primary_axis_align_items
         .as_deref()
         .and_then(map_alignment);
+    // Figma's default `counterAxisAlignItems` (when unspecified in the REST
+    // response) is MIN — i.e. align children to the start of the cross axis.
+    // CSS flex's default is `stretch`, which grows hug-sized children to fill
+    // the cross axis (e.g. a "Hi Ellie" pill that should hug its text becomes
+    // full container width). For auto-layout frames, fall back to Start when
+    // Figma omits the field.
     let cross_axis_align = figma
         .counter_axis_align_items
         .as_deref()
-        .and_then(map_alignment);
+        .and_then(map_alignment)
+        .or_else(|| {
+            if has_auto_layout {
+                Some(Alignment::Start)
+            } else {
+                None
+            }
+        });
 
-    // Overflow
+    // Overflow: Figma's `clipsContent` → CSS `overflow:hidden`. Figma DOES clip
+    // absolutely-positioned children that extend past the frame, same as CSS
+    // does. Honor the flag literally.
     let overflow = if figma.clips_content == Some(true) {
         Some(Overflow::Hidden)
     } else {
         None
     };
 
-    // Rotation (Figma stores radians, convert to degrees, no negation)
-    let rotation = figma.rotation.and_then(|r| {
-        if r.abs() < 0.001 {
+    // Rotation + flip extraction from `relativeTransform`.
+    //
+    // Figma reports BOTH a `rotation` field (radians) and a `relativeTransform`
+    // 2×3 matrix. `rotation` is derived from the matrix via `atan2(m[1][0], m[0][0])`
+    // — but that derivation can't distinguish a pure rotation from a reflection.
+    // E.g. `[[-1, 0], [0, 1]]` is `scaleX(-1)` (a flip), yet `atan2(0, -1) = π`,
+    // so Figma reports `rotation = π` too. Blindly reading `rotation` AND the
+    // matrix flip-sign leads to double-counting: we'd emit `rotate-180 + scale-y(-1)`
+    // for a node that was really just `scale-x(-1)`.
+    //
+    // Fix: when `relativeTransform` is present, decompose it ourselves and
+    // ignore the `rotation` field. Only fall back to `rotation` when no matrix
+    // was provided.
+    let (rotation, flip_x, flip_y) = if let Some(m) = figma.relative_transform.as_ref() {
+        let a = m[0][0];
+        let b = m[1][0];
+        let c = m[0][1];
+        let d = m[1][1];
+        let det = a * d - b * c;
+        // Pick which axis carries the reflection sign. Convention: if det<0,
+        // one axis is flipped. We split rotation vs flip by assuming the flip
+        // is on the axis whose scale magnitude matches and whose sign is
+        // negative after peeling off the rotation.
+        let sx_mag = (a * a + b * b).sqrt();
+        let sy_mag = (c * c + d * d).sqrt();
+        let rot_rad = if sx_mag > 0.0 {
+            // Rotation angle when there's no skew: theta = atan2(b, a). When
+            // a reflection is present we need to flip the sign of a (or c) to
+            // recover the pure rotation; see decision below.
+            if det < 0.0 {
+                // Flip distributed to x-axis — rotation comes from (−a, b).
+                (-b).atan2(-a)
+            } else {
+                b.atan2(a)
+            }
+        } else {
+            0.0
+        };
+        let rotation = if rot_rad.abs() < 0.001 {
             None
         } else {
-            Some(round_decimal(r.to_degrees(), 2))
-        }
-    });
-
-    // Detect flip from relativeTransform matrix (negative determinant = flipped)
-    let (flip_x, flip_y) = figma
-        .relative_transform
-        .as_ref()
-        .map(|m| {
-            let t = decompose_matrix(m);
-            (t.scale_x < 0.0, t.scale_y < 0.0)
-        })
-        .map(|(fx, fy)| {
-            (
-                if fx { Some(true) } else { None },
-                if fy { Some(true) } else { None },
-            )
-        })
-        .unwrap_or((None, None));
+            Some(round_decimal(rot_rad.to_degrees(), 2))
+        };
+        // With `det < 0` we always attribute the flip to x-axis so the rotation
+        // stays on one axis only. (Attributing to y would be equivalent modulo
+        // an extra 180° of rotation — we pick x to keep output deterministic.)
+        let flip_x = if det < 0.0 { Some(true) } else { None };
+        let flip_y = None;
+        (rotation, flip_x, flip_y)
+    } else {
+        // Matrix missing — fall back to the `rotation` scalar with no flip info.
+        let rotation = figma.rotation.and_then(|r| {
+            if r.abs() < 0.001 {
+                None
+            } else {
+                Some(round_decimal(r.to_degrees(), 2))
+            }
+        });
+        (rotation, None, None)
+    };
 
     // Flex wrap
     let wrap = figma.layout_wrap.as_deref().map(|w| w == "WRAP");
@@ -634,9 +888,13 @@ fn map_alignment(s: &str) -> Option<Alignment> {
     }
 }
 
-fn build_style(figma: &FigmaNode, assets: &mut Vec<Asset>) -> Option<Style> {
-    let fills = transform_fills(&figma.fills, assets, &figma.id, &figma.name);
-    let stroke = transform_stroke(figma, assets);
+fn build_style(
+    figma: &FigmaNode,
+    assets: &mut Vec<Asset>,
+    asset_ids: &mut FxHashSet<String>,
+) -> Option<Style> {
+    let fills = transform_fills(&figma.fills, assets, asset_ids, &figma.id, &figma.name);
+    let stroke = transform_stroke(figma);
     let border_radius = transform_border_radius(figma);
     let effects = transform_effects(figma);
     let opacity = figma.opacity.filter(|o| (*o - 1.0).abs() > 0.01);
@@ -665,13 +923,14 @@ fn build_style(figma: &FigmaNode, assets: &mut Vec<Asset>) -> Option<Style> {
 fn transform_fills(
     fills: &[FigmaPaint],
     assets: &mut Vec<Asset>,
+    asset_ids: &mut FxHashSet<String>,
     node_id: &str,
     node_name: &str,
 ) -> Option<Vec<Fill>> {
     let result: Vec<Fill> = fills
         .iter()
         .filter(|f| f.visible)
-        .filter_map(|f| transform_fill(f, assets, node_id, node_name))
+        .filter_map(|f| transform_fill(f, assets, asset_ids, node_id, node_name))
         .collect();
     if result.is_empty() {
         None
@@ -683,6 +942,7 @@ fn transform_fills(
 fn transform_fill(
     paint: &FigmaPaint,
     assets: &mut Vec<Asset>,
+    asset_ids: &mut FxHashSet<String>,
     node_id: &str,
     node_name: &str,
 ) -> Option<Fill> {
@@ -721,7 +981,10 @@ fn transform_fill(
                 })
                 .unwrap_or_default();
 
-            // Compute gradient angle from handle positions
+            // Compute gradient angle from handle positions.
+            // Figma handles are in normalized local coords (y-down); we convert
+            // atan2(dy,dx) from the "0°=east, 90°=south" convention to CSS
+            // linear-gradient's "0°=to top, 90°=to right" by adding 90°.
             let angle = if gradient_type == GradientType::Linear {
                 paint
                     .gradient_handle_positions
@@ -730,7 +993,8 @@ fn transform_fill(
                     .map(|h| {
                         let dx = h[1].x - h[0].x;
                         let dy = h[1].y - h[0].y;
-                        round_decimal(dy.atan2(dx).to_degrees(), 2)
+                        let raw = (dy.atan2(dx).to_degrees() + 90.0).rem_euclid(360.0);
+                        round_decimal(raw, 2)
                     })
             } else {
                 None
@@ -745,7 +1009,7 @@ fn transform_fill(
         "IMAGE" => {
             // Use the Figma node ID as asset ID — the export API needs node IDs, not imageRefs.
             let asset_id = node_id.to_string();
-            if !assets.iter().any(|a| a.id == asset_id) {
+            if asset_ids.insert(asset_id.clone()) {
                 assets.push(Asset {
                     id: asset_id.clone(),
                     name: node_name.to_string(),
@@ -813,7 +1077,7 @@ impl CloneForHex for crate::figma::types::FigmaColor {
     }
 }
 
-fn transform_stroke(figma: &FigmaNode, assets: &mut Vec<Asset>) -> Option<Stroke> {
+fn transform_stroke(figma: &FigmaNode) -> Option<Stroke> {
     let visible_stroke = figma.strokes.iter().find(|s| s.visible)?;
     let color = resolve_paint_color(visible_stroke)?;
     let width = round_half_px(figma.stroke_weight.unwrap_or(1.0));
@@ -835,9 +1099,6 @@ fn transform_stroke(figma: &FigmaNode, assets: &mut Vec<Asset>) -> Option<Stroke
     });
 
     let dashed = figma.stroke_dashes.as_ref().map(|d| !d.is_empty());
-
-    // Register stroke image assets if needed (rare but possible)
-    let _ = assets;
 
     Some(Stroke {
         color,
@@ -932,11 +1193,12 @@ fn transform_effects(figma: &FigmaNode) -> Option<Vec<Effect>> {
 fn make_text_node(
     figma: &FigmaNode,
     assets: &mut Vec<Asset>,
+    asset_ids: &mut FxHashSet<String>,
     parent_layout_mode: Option<&LayoutMode>,
     parent_bb: Option<&BoundingBox>,
 ) -> Node {
     let layout = build_layout(figma, parent_layout_mode, parent_bb);
-    let style_obj = build_style(figma, assets);
+    let style_obj = build_style(figma, assets, asset_ids);
 
     // Resolve text color from style fills (character-level fills override node fills)
     let text_style = figma.style.as_ref();
@@ -984,15 +1246,27 @@ fn make_text_node(
     let text_props = text_style.map(|ts| {
         let font_size = ts.font_size.map(round_half_px);
         let font_weight = ts.font_weight.map(|w| w as u32);
-        let line_height = ts.line_height_px.and_then(|lh| {
-            ts.font_size.map(|fs| {
-                if fs > 0.0 {
-                    round_decimal(lh / fs, 3)
-                } else {
-                    1.0
-                }
-            })
-        });
+        // Line-height precedence:
+        //   * `lineHeightUnit == "INTRINSIC_%"` → font default, emit nothing.
+        //   * `lineHeightPercentFontSize` → ratio = pct / 100 (most common).
+        //   * `lineHeightPx` / `fontSize` → fallback when only pixels are provided.
+        let line_height = if ts.line_height_unit.as_deref() == Some("INTRINSIC_%") {
+            None
+        } else {
+            ts.line_height_percent_font_size
+                .map(|p| round_decimal(p / 100.0, 3))
+                .or_else(|| {
+                    ts.line_height_px.and_then(|lh| {
+                        ts.font_size.map(|fs| {
+                            if fs > 0.0 {
+                                round_decimal(lh / fs, 3)
+                            } else {
+                                1.0
+                            }
+                        })
+                    })
+                })
+        };
         let letter_spacing = ts.letter_spacing.and_then(|ls| {
             ts.font_size.map(|fs| {
                 if fs > 0.0 {
@@ -1016,6 +1290,17 @@ fn make_text_node(
             "STRIKETHROUGH" => Some(TextDecoration::Strikethrough),
             _ => None,
         });
+
+        let text_decoration_style = ts.text_decoration_style.as_deref().and_then(|s| match s {
+            "SOLID" => Some(TextDecorationStyle::Solid),
+            "DOUBLE" => Some(TextDecorationStyle::Double),
+            "DOTTED" => Some(TextDecorationStyle::Dotted),
+            "DASHED" => Some(TextDecorationStyle::Dashed),
+            "WAVY" => Some(TextDecorationStyle::Wavy),
+            _ => None,
+        });
+        let text_decoration_offset = ts.text_decoration_offset.map(round_half_px);
+        let text_decoration_thickness = ts.text_decoration_thickness.map(round_half_px);
 
         let text_transform = ts.text_case.as_deref().and_then(|c| match c {
             "UPPER" => Some(TextTransform::Uppercase),
@@ -1066,6 +1351,9 @@ fn make_text_node(
             letter_spacing,
             text_align,
             text_decoration,
+            text_decoration_style,
+            text_decoration_offset,
+            text_decoration_thickness,
             text_transform,
             truncation,
             italic,
@@ -1099,10 +1387,15 @@ fn make_text_node(
 fn make_image_node(
     figma: &FigmaNode,
     assets: &mut Vec<Asset>,
+    asset_ids: &mut FxHashSet<String>,
     parent_layout_mode: Option<&LayoutMode>,
     parent_bb: Option<&BoundingBox>,
 ) -> Node {
     let mut layout = build_layout(figma, parent_layout_mode, parent_bb);
+    // Images render as `<img>` / `<IconX>` leaves regardless of how many
+    // Figma children they had. Promote Hug dims to bbox so the rendered
+    // element has intrinsic size instead of stretching to 100% of parent.
+    promote_hug_to_bbox(&mut layout, figma);
 
     // Compute aspect ratio from bounding box for images
     if let Some(ref bb) = figma.absolute_bounding_box
@@ -1113,8 +1406,8 @@ fn make_image_node(
     }
 
     // Register image assets from fills OR export shape as SVG
-    let fills = transform_fills(&figma.fills, assets, &figma.id, &figma.name);
-    let has_image_asset = assets.iter().any(|a| a.id == figma.id);
+    let fills = transform_fills(&figma.fills, assets, asset_ids, &figma.id, &figma.name);
+    let has_image_asset = asset_ids.contains(&figma.id);
 
     // Try to extract inline SVG paths from fillGeometry for simple vectors.
     // Avoids a remote SVG export round-trip — renders directly in JSX.
@@ -1133,19 +1426,21 @@ fn make_image_node(
                 | "BOOLEAN_OPERATION"
         );
         let format = if is_shape { "svg" } else { "png" };
-        assets.push(Asset {
-            id: figma.id.clone(),
-            name: figma.name.clone(),
-            asset_type: if format == "svg" {
-                AssetType::Svg
-            } else {
-                AssetType::Image
-            },
-            format: format.into(),
-            data: String::new(),
-            url: None,
-            source_ref: None,
-        });
+        if asset_ids.insert(figma.id.clone()) {
+            assets.push(Asset {
+                id: figma.id.clone(),
+                name: figma.name.clone(),
+                asset_type: if format == "svg" {
+                    AssetType::Svg
+                } else {
+                    AssetType::Image
+                },
+                format: format.into(),
+                data: String::new(),
+                url: None,
+                source_ref: None,
+            });
+        }
     }
     let style = Some(Style {
         fills,
@@ -1364,6 +1659,7 @@ mod tests {
             min_height: None,
             max_height: None,
             layout_align: None,
+            layout_grow: None,
             overflow_direction: None,
             grid_row_gap: None,
             grid_column_gap: None,
@@ -1455,9 +1751,14 @@ mod tests {
             font_weight: Some(600.0),
             font_size: Some(16.0),
             line_height_px: Some(24.0),
+            line_height_percent_font_size: None,
+            line_height_unit: None,
             letter_spacing: None,
             text_align_horizontal: Some("CENTER".into()),
             text_decoration: None,
+            text_decoration_style: None,
+            text_decoration_offset: None,
+            text_decoration_thickness: None,
             text_case: None,
             text_truncation: None,
             italic: None,
@@ -1586,5 +1887,222 @@ mod tests {
         assert_eq!(round_decimal(1.5555, 2), 1.56);
         assert_eq!(round_decimal(1.5555, 3), 1.556);
         assert_eq!(round_decimal(1.0, 2), 1.0);
+    }
+
+    #[test]
+    fn test_linear_gradient_angle_css_convention() {
+        use crate::figma::types::{FigmaColor, FigmaColorStop, FigmaVector};
+
+        fn make_linear_gradient(handles: Vec<FigmaVector>) -> FigmaPaint {
+            FigmaPaint {
+                paint_type: "GRADIENT_LINEAR".into(),
+                visible: true,
+                opacity: None,
+                color: None,
+                gradient_stops: Some(vec![
+                    FigmaColorStop {
+                        position: 0.0,
+                        color: FigmaColor {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        },
+                    },
+                    FigmaColorStop {
+                        position: 1.0,
+                        color: FigmaColor {
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                            a: 1.0,
+                        },
+                    },
+                ]),
+                gradient_handle_positions: Some(handles),
+                image_ref: None,
+                scale_mode: None,
+                bound_variables: None,
+            }
+        }
+
+        fn extract_angle(paint: &FigmaPaint) -> Option<f64> {
+            let mut assets = Vec::new();
+            let mut ids = FxHashSet::default();
+            match transform_fill(paint, &mut assets, &mut ids, "nid", "nname")? {
+                Fill::Gradient { angle, .. } => angle,
+                _ => None,
+            }
+        }
+
+        // Top-to-bottom: Figma handles go from (0.5, 0) to (0.5, 1) → CSS 180° ("to bottom").
+        let p = make_linear_gradient(vec![
+            FigmaVector { x: 0.5, y: 0.0 },
+            FigmaVector { x: 0.5, y: 1.0 },
+        ]);
+        assert_eq!(extract_angle(&p), Some(180.0));
+
+        // Left-to-right: (0,0.5) → (1,0.5) → CSS 90° ("to right").
+        let p = make_linear_gradient(vec![
+            FigmaVector { x: 0.0, y: 0.5 },
+            FigmaVector { x: 1.0, y: 0.5 },
+        ]);
+        assert_eq!(extract_angle(&p), Some(90.0));
+
+        // Top-left → bottom-right: (0,0) → (1,1) → CSS 135°.
+        let p = make_linear_gradient(vec![
+            FigmaVector { x: 0.0, y: 0.0 },
+            FigmaVector { x: 1.0, y: 1.0 },
+        ]);
+        assert_eq!(extract_angle(&p), Some(135.0));
+    }
+
+    /// Minimal `FigmaTypeStyle` with only a font size — handy for line-height tests.
+    fn make_type_style(font_size: f64) -> FigmaTypeStyle {
+        FigmaTypeStyle {
+            font_family: None,
+            font_weight: None,
+            font_size: Some(font_size),
+            line_height_px: None,
+            line_height_percent_font_size: None,
+            line_height_unit: None,
+            letter_spacing: None,
+            text_align_horizontal: None,
+            text_decoration: None,
+            text_decoration_style: None,
+            text_decoration_offset: None,
+            text_decoration_thickness: None,
+            text_case: None,
+            text_truncation: None,
+            italic: None,
+            text_align_vertical: None,
+            paragraph_spacing: None,
+            max_lines: None,
+            hyperlink: None,
+            opentype_flags: None,
+            fills: None,
+            bound_variables: None,
+        }
+    }
+
+    fn text_node_with_style(style: FigmaTypeStyle) -> FigmaNode {
+        let mut root = make_figma_node("Root", "FRAME");
+        root.layout_mode = Some("VERTICAL".into());
+        let mut text = make_figma_node("Label", "TEXT");
+        text.characters = Some("Hi".into());
+        text.style = Some(style);
+        root.children = vec![text];
+        root
+    }
+
+    #[test]
+    fn test_line_height_from_percent_font_size() {
+        let mut ts = make_type_style(16.0);
+        ts.line_height_percent_font_size = Some(150.0);
+        let ir = figma_to_ir("T", &text_node_with_style(ts));
+        let tp = ir.components[0].children[0].text.as_ref().unwrap();
+        assert!((tp.line_height.unwrap() - 1.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_line_height_intrinsic_emits_none() {
+        let mut ts = make_type_style(16.0);
+        ts.line_height_unit = Some("INTRINSIC_%".into());
+        // Even if Figma happens to send a px/percent value alongside INTRINSIC_%,
+        // we honor the unit and emit nothing.
+        ts.line_height_px = Some(24.0);
+        ts.line_height_percent_font_size = Some(150.0);
+        let ir = figma_to_ir("T", &text_node_with_style(ts));
+        let tp = ir.components[0].children[0].text.as_ref().unwrap();
+        assert_eq!(tp.line_height, None);
+    }
+
+    #[test]
+    fn test_line_height_percent_wins_over_px() {
+        // When both are present, `lineHeightPercentFontSize` is the primary source.
+        let mut ts = make_type_style(16.0);
+        ts.line_height_percent_font_size = Some(175.0);
+        ts.line_height_px = Some(24.0); // would be 1.5 — should be ignored
+        let ir = figma_to_ir("T", &text_node_with_style(ts));
+        let tp = ir.components[0].children[0].text.as_ref().unwrap();
+        assert!((tp.line_height.unwrap() - 1.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_line_height_px_fallback() {
+        // With no percent value, fall back to px / fontSize.
+        let mut ts = make_type_style(16.0);
+        ts.line_height_px = Some(24.0);
+        let ir = figma_to_ir("T", &text_node_with_style(ts));
+        let tp = ir.components[0].children[0].text.as_ref().unwrap();
+        assert!((tp.line_height.unwrap() - 1.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_hug_leaf_promotes_to_fixed_from_bb() {
+        // Leaf VECTOR with HUG sizing used to emit no width/height class,
+        // stretching to 100% of parent (300px black blobs). Now we promote
+        // to Fixed using the bounding box dimensions. Use a parent with two
+        // children so wrapper-flattening doesn't swallow the icon.
+        let mut root = make_figma_node("Root", "FRAME");
+        root.layout_mode = Some("HORIZONTAL".into());
+        root.absolute_bounding_box = Some(BoundingBox {
+            x: 0.0,
+            y: 0.0,
+            width: 200.0,
+            height: 100.0,
+        });
+        let mut icon = make_figma_node("Icon", "VECTOR");
+        icon.layout_sizing_horizontal = Some("HUG".into());
+        icon.layout_sizing_vertical = Some("HUG".into());
+        icon.absolute_bounding_box = Some(BoundingBox {
+            x: 0.0,
+            y: 0.0,
+            width: 16.0,
+            height: 16.0,
+        });
+        let sibling = make_figma_node("Sibling", "FRAME");
+        root.children = vec![icon, sibling];
+
+        let ir = figma_to_ir("T", &root);
+        let icon_node = &ir.components[0].children[0];
+        let layout = icon_node.layout.as_ref().unwrap();
+        let w = layout.width.as_ref().expect("width should be set");
+        let h = layout.height.as_ref().expect("height should be set");
+        assert_eq!(w.dim_type, DimensionType::Fixed);
+        assert_eq!(w.value, Some(16.0));
+        assert_eq!(h.dim_type, DimensionType::Fixed);
+        assert_eq!(h.value, Some(16.0));
+    }
+
+    #[test]
+    fn test_layout_grow_becomes_fill() {
+        // layoutGrow: 1 on a child of a HORIZONTAL parent means "fill main
+        // axis" — its width should be Fill regardless of layoutSizing.
+        let mut root = make_figma_node("Root", "FRAME");
+        root.layout_mode = Some("HORIZONTAL".into());
+        root.absolute_bounding_box = Some(BoundingBox {
+            x: 0.0,
+            y: 0.0,
+            width: 400.0,
+            height: 100.0,
+        });
+        let mut child = make_figma_node("Grower", "FRAME");
+        child.layout_grow = Some(1.0);
+        child.layout_sizing_horizontal = Some("FIXED".into());
+        child.absolute_bounding_box = Some(BoundingBox {
+            x: 0.0,
+            y: 0.0,
+            width: 50.0,
+            height: 100.0,
+        });
+        root.children = vec![child];
+
+        let ir = figma_to_ir("T", &root);
+        let grower = &ir.components[0].children[0];
+        let layout = grower.layout.as_ref().unwrap();
+        let w = layout.width.as_ref().expect("width should be set");
+        assert_eq!(w.dim_type, DimensionType::Fill);
+        assert_eq!(w.value, None);
     }
 }

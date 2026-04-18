@@ -42,6 +42,12 @@ impl WarningCollector {
     pub fn warnings(&self) -> &[Warning] {
         &self.warnings
     }
+
+    /// Drain another collector's warnings into this one. Used to merge results
+    /// from parallel workers.
+    pub fn merge(&mut self, other: WarningCollector) {
+        self.warnings.extend(other.warnings);
+    }
 }
 
 #[cfg(test)]

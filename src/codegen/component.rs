@@ -1,3 +1,4 @@
+use crate::codegen::fonts::{custom_font_fallback_class, is_google_font};
 use crate::codegen::tree::IconLibrary;
 use crate::codegen::variant::{self, VariantProp};
 use crate::emit::formatter::{escape_jsx_text, indent, join_classes, sanitize_component_name};
@@ -6,11 +7,19 @@ use crate::ir::schema::{
 };
 use crate::tailwind::{layout, style, text, text as text_tw};
 use crate::warning::WarningCollector;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 
-/// Maps asset ID → relative file path (e.g., "hero.png")
-pub type AssetMap = HashMap<String, String>;
+/// Maps asset ID → relative file path (e.g., "hero.png").
+/// Internal-only; uses `FxHashMap` because keys are trusted Figma IDs (no DoS surface)
+/// and it's 2–3× faster than SipHash for short string keys.
+pub type AssetMap = FxHashMap<String, String>;
+
+/// Maps asset ID → generated icon component name (e.g., "IconArrowLeft").
+/// Populated only for SVG assets that were emitted as React components
+/// (svg_mode == ReactComponent + passed renderable/non-divider filters).
+pub type IconMap = FxHashMap<String, String>;
 
 #[allow(clippy::too_many_arguments)]
 pub fn generate_component(
@@ -21,24 +30,100 @@ pub fn generate_component(
     responsive: bool,
     icon_library: &IconLibrary,
     asset_map: &AssetMap,
+    icon_map: &IconMap,
     warnings: &mut WarningCollector,
 ) -> String {
     let name = sanitize_component_name(&node.name);
     let has_children = !node.children.is_empty();
-    let mut output = String::new();
 
     let variant_props = extract_variant_props(node);
     let uses_cn = !variant_props.is_empty();
 
-    let font_block = generate_font_block(node);
+    // Render body first so we know which icons were actually referenced.
+    let mut used_icons: FxHashSet<String> = FxHashSet::default();
+    let mut body = String::new();
+
+    let mut font_data: FxHashMap<String, BTreeSet<u32>> = FxHashMap::default();
+    collect_font_data(node, &mut font_data);
+    let font_vars: Vec<String> = font_data
+        .keys()
+        .filter(|f| is_google_font(f))
+        .map(|f| google_font_var_ident(f))
+        .collect();
+
+    let _ = writeln!(body, "{}return (", indent(1));
+    // Text descendants using the default body font (Inter) deliberately omit
+    // their `font-[var(--font-inter)]` class in `text_classes`. For that to
+    // render Inter (not the browser serif default), the root wrapper must
+    // apply Inter as the font-family. Applying it here via `font-[var(...)]`
+    // on the `contents` wrapper lets children inherit the correct family
+    // without adding a layout box. Only emit when the subtree actually uses
+    // Inter (`font_data` has an "Inter" key).
+    let uses_inter = font_data.keys().any(|f| f == "Inter");
+    let (wrap_open, wrap_close, inner_depth) = if font_vars.is_empty() && !uses_inter {
+        (String::new(), String::new(), 2)
+    } else {
+        let var_exprs = font_vars
+            .iter()
+            .map(|v| format!("${{{v}.variable}}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let family_class = if uses_inter {
+            "font-[var(--font-inter)] "
+        } else {
+            ""
+        };
+        let class_expr = if var_exprs.is_empty() {
+            format!("{family_class}contents")
+        } else {
+            format!("{var_exprs} {family_class}contents")
+        };
+        (
+            format!("{}<div className={{`{class_expr}`}}>\n", indent(2)),
+            format!("{}</div>\n", indent(2)),
+            3,
+        )
+    };
+    body.push_str(&wrap_open);
+    render_node(
+        &mut body,
+        node,
+        inner_depth,
+        None,
+        None,
+        true,
+        theme_colors,
+        asset_public_base,
+        responsive,
+        icon_library,
+        asset_map,
+        icon_map,
+        &mut used_icons,
+        warnings,
+    );
+    body.push_str(&wrap_close);
+    let _ = writeln!(body, "{});", indent(1));
+    body.push_str("}\n");
+
+    // Assemble final output with imports at the top.
+    let mut output = String::new();
+    let font_block = generate_font_block(node, warnings);
     if !font_block.is_empty() {
         output.push_str(&font_block);
         output.push('\n');
     }
-
-    // Import cn only when needed (variant components use conditional classes)
     if uses_cn {
         let _ = writeln!(output, "import {{ cn }} from '{cn_import}';\n");
+    }
+    if !used_icons.is_empty() {
+        let mut icons: Vec<&String> = used_icons.iter().collect();
+        icons.sort();
+        let list = icons
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(output, "import {{ {list} }} from '../icons';\n");
     }
 
     if !variant_props.is_empty() {
@@ -66,55 +151,12 @@ pub fn generate_component(
         let _ = writeln!(output, "export function {name}() {{");
     }
 
-    // Collect font variable idents so we can expose the CSS variables to
-    // descendants via a display:contents wrapper (avoids an extra layout box).
-    let mut font_data: HashMap<String, BTreeSet<u32>> = HashMap::new();
-    collect_font_data(node, &mut font_data);
-    let font_vars: Vec<String> = font_data
-        .keys()
-        .filter(|f| is_google_font(f))
-        .map(|f| google_font_var_ident(f))
-        .collect();
-
-    let _ = writeln!(output, "{}return (", indent(1));
-    let (wrap_open, wrap_close, inner_depth) = if font_vars.is_empty() {
-        (String::new(), String::new(), 2)
-    } else {
-        let expr = font_vars
-            .iter()
-            .map(|v| format!("${{{v}.variable}}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        (
-            format!("{}<div className={{`{expr} contents`}}>\n", indent(2)),
-            format!("{}</div>\n", indent(2)),
-            3,
-        )
-    };
-    output.push_str(&wrap_open);
-    render_node(
-        &mut output,
-        node,
-        inner_depth,
-        None,
-        None,
-        true,
-        theme_colors,
-        asset_public_base,
-        responsive,
-        icon_library,
-        asset_map,
-        warnings,
-    );
-    output.push_str(&wrap_close);
-    let _ = writeln!(output, "{});", indent(1));
-    output.push_str("}\n");
-
+    output.push_str(&body);
     output
 }
 
-fn generate_font_block(root: &Node) -> String {
-    let mut font_data: HashMap<String, BTreeSet<u32>> = HashMap::new();
+fn generate_font_block(root: &Node, warnings: &mut WarningCollector) -> String {
+    let mut font_data: FxHashMap<String, BTreeSet<u32>> = FxHashMap::default();
     collect_font_data(root, &mut font_data);
     if font_data.is_empty() {
         return String::new();
@@ -124,8 +166,25 @@ fn generate_font_block(root: &Node) -> String {
         .iter()
         .filter(|(f, _)| is_google_font(f))
         .collect();
-    google.sort_by_key(|(f, _)| f.to_string());
-    let custom: Vec<&String> = font_data.keys().filter(|f| !is_google_font(f)).collect();
+    google.sort_by(|a, b| a.0.cmp(b.0));
+    let mut custom: Vec<&String> = font_data.keys().filter(|f| !is_google_font(f)).collect();
+    custom.sort();
+
+    // Raise a stderr-visible warning for each custom family so users notice
+    // the fallback without having to read the generated TSX comment. The
+    // text-rendering side (`tailwind::text::text_classes`) emits a
+    // `font-serif`/`font-sans` fallback in place of a dead CSS variable.
+    for family in &custom {
+        let fallback = custom_font_fallback_class(family);
+        warnings.warn(
+            &root.id,
+            &root.name,
+            &format!(
+                "Custom font \"{family}\" detected. Emitted {fallback} fallback. \
+                 To use the real font, add @font-face in app/layout.tsx or use next/font/local."
+            ),
+        );
+    }
 
     let mut block = String::new();
     if !google.is_empty() {
@@ -168,7 +227,7 @@ fn generate_font_block(root: &Node) -> String {
     block
 }
 
-fn collect_font_data(node: &Node, out: &mut HashMap<String, BTreeSet<u32>>) {
+fn collect_font_data(node: &Node, out: &mut FxHashMap<String, BTreeSet<u32>>) {
     if let Some(text) = &node.text
         && let Some(family) = &text.font_family
     {
@@ -187,46 +246,26 @@ fn collect_font_data(node: &Node, out: &mut HashMap<String, BTreeSet<u32>>) {
     }
 }
 
-fn is_google_font(family: &str) -> bool {
-    // Keep this curated so custom families are not incorrectly imported.
-    const GOOGLE_FONTS: &[&str] = &[
-        "Inter",
-        "JetBrains Mono",
-        "Roboto",
-        "Poppins",
-        "Manrope",
-        "DM Sans",
-        "Open Sans",
-        "Lato",
-        "Montserrat",
-        "Nunito",
-        "Playfair Display",
-        "Source Sans 3",
-        "Work Sans",
-        "Fira Code",
-        "Merriweather",
-        "Plus Jakarta Sans",
-    ];
-    GOOGLE_FONTS.contains(&family)
-}
-
 fn google_font_import_ident(family: &str) -> String {
     family.replace(' ', "_")
 }
 
 fn google_font_var_ident(family: &str) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(family.len());
+    let mut last_was_sep = true;
     for ch in family.chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
-        } else {
+            last_was_sep = false;
+        } else if !last_was_sep {
             out.push('_');
+            last_was_sep = true;
         }
     }
-    while out.contains("__") {
-        out = out.replace("__", "_");
+    if out.ends_with('_') {
+        out.pop();
     }
-    out.trim_matches('_').to_string()
+    out
 }
 
 fn extract_variant_props(node: &Node) -> Vec<VariantProp> {
@@ -238,6 +277,16 @@ fn extract_variant_props(node: &Node) -> Vec<VariantProp> {
         return variant::extract_variant_props(variants, &defaults);
     }
     vec![]
+}
+
+/// Returns true if any descendant of `node` (in its subtree, excluding `node`
+/// itself) is a text node. Used to decide whether to suppress container
+/// flip/rotate transforms that would visually mirror text in CSS but not in
+/// Figma.
+fn has_text_descendant(node: &Node) -> bool {
+    node.children
+        .iter()
+        .any(|child| child.node_type == NodeType::Text || has_text_descendant(child))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -253,11 +302,13 @@ fn render_node(
     responsive: bool,
     icon_library: &IconLibrary,
     asset_map: &AssetMap,
+    icon_map: &IconMap,
+    used_icons: &mut FxHashSet<String>,
     warnings: &mut WarningCollector,
 ) {
     match node.node_type {
         NodeType::Text => {
-            render_text_node(out, node, depth, theme_colors);
+            render_text_node(out, node, depth, theme_colors, warnings);
         }
         NodeType::Image => {
             render_image_node(
@@ -268,6 +319,8 @@ fn render_node(
                 asset_public_base,
                 parent_name,
                 asset_map,
+                icon_map,
+                used_icons,
                 warnings,
             );
         }
@@ -288,6 +341,8 @@ fn render_node(
                 responsive,
                 icon_library,
                 asset_map,
+                icon_map,
+                used_icons,
                 warnings,
             );
         }
@@ -299,9 +354,27 @@ fn render_text_node(
     node: &Node,
     depth: usize,
     theme_colors: Option<&HashMap<String, String>>,
+    warnings: &mut WarningCollector,
 ) {
     let ind = indent(depth);
     let mut classes = Vec::new();
+
+    // paragraph_spacing has no single-span CSS target (we emit as one <span>).
+    // When content contains multiple paragraphs, surface a warning so users can
+    // manually wrap in <p> with `mb-[Xpx]`.
+    if let Some(ref tp) = node.text
+        && let Some(ps) = tp.paragraph_spacing
+        && ps > 0.0
+        && tp.content.contains("\n\n")
+    {
+        warnings.warn(
+            &node.id,
+            &node.name,
+            &format!(
+                "Multi-paragraph text with paragraphSpacing={ps}px detected; fig2r renders as single span — manually wrap in <p> with mb-[{ps}px]"
+            ),
+        );
+    }
 
     // Detect bullet marker nodes: empty/zero-width content + list_type set.
     // Figma stores these as separate tiny text nodes (21px wide, variable height)
@@ -395,8 +468,19 @@ fn render_text_node(
         .as_ref()
         .and_then(|l| l.width.as_ref())
         .is_none_or(|d| d.dim_type == DimensionType::Hug);
+    // Determine whether the content or any span contains a newline. Figma
+    // authors use `\n` / `\n\n` for paragraph breaks; without a `whitespace`
+    // override, CSS collapses those into a single space so paragraphs run
+    // together. `whitespace-pre-line` preserves newlines as line breaks while
+    // still collapsing runs of spaces.
+    let node_has_newline = node
+        .text
+        .as_ref()
+        .is_some_and(|t| t.content.contains('\n') || t.spans.as_ref().is_some_and(|sp| sp.iter().any(|s| s.content.contains('\n'))));
     if is_hug_width {
         classes.push("whitespace-nowrap".into());
+    } else if node_has_newline {
+        classes.push("whitespace-pre-line".into());
     }
 
     let href = node.text.as_ref().and_then(|t| t.hyperlink.as_ref());
@@ -520,8 +604,12 @@ fn span_classes(span: &crate::ir::schema::TextSpan) -> String {
     if let Some(ref fam) = span.font_family
         && fam != "Inter"
     {
-        let css_var = text_tw::google_font_css_var(fam);
-        classes.push(format!("font-[var({css_var})]"));
+        if is_google_font(fam) {
+            let css_var = text_tw::google_font_css_var(fam);
+            classes.push(format!("font-[var({css_var})]"));
+        } else {
+            classes.push(custom_font_fallback_class(fam).to_string());
+        }
     }
     if let Some(s) = span.font_size {
         classes.push(format!("text-[{s}px]"));
@@ -541,6 +629,8 @@ fn render_image_node(
     asset_public_base: &str,
     parent_name: Option<&str>,
     asset_map: &AssetMap,
+    icon_map: &IconMap,
+    used_icons: &mut FxHashSet<String>,
     warnings: &mut WarningCollector,
 ) {
     let ind = indent(depth);
@@ -550,18 +640,90 @@ fn render_image_node(
         return;
     }
 
+    // Figma exports image assets (PNG + rasterized SVG) WITH transforms already
+    // baked in — the downloaded pixels show the rotated/flipped result. Vector
+    // paths we extract from `fillGeometry`, on the other hand, are in the node's
+    // pre-transform local coordinate space, so the transform must be applied in
+    // CSS. Track whether we're going to render from inline paths to decide.
+    let will_render_inline_svg = node
+        .vector_paths
+        .as_ref()
+        .is_some_and(|p| !p.is_empty());
+
     if let Some(ref l) = node.layout {
         classes.extend(layout::size_classes(l));
+        if let Some(ref pos) = l.position {
+            classes.push("absolute".into());
+            classes.push(format!("top-[{}px]", pos.y));
+            classes.push(format!("left-[{}px]", pos.x));
+        }
+        // Only apply CSS rotation/flip when rendering inline (pre-transform
+        // coords). For `<img>` / `<IconX>` (Figma-exported post-transform
+        // pixels), the transform is already baked in and double-applying
+        // would flip the mascot the wrong way.
+        if will_render_inline_svg {
+            if let Some(rotation) = l.rotation {
+                classes.push(format!("rotate-[{rotation:.2}deg]"));
+            }
+            if l.flip_x == Some(true) {
+                classes.push("scale-x-[-1]".into());
+            }
+            if l.flip_y == Some(true) {
+                classes.push("scale-y-[-1]".into());
+            }
+        }
+        if let Some(z) = l.z_index {
+            classes.push(format!("z-[{z}]"));
+        }
     }
     // For image nodes, don't add fill classes — the SVG/PNG already contains the colors.
     // Only add border-radius, stroke, effects, opacity, blend_mode.
     collect_style_classes_no_fills(&mut classes, node, theme_colors, warnings);
 
-    // Inline SVG from extracted vector paths — no remote asset download needed.
-    if let Some(ref paths) = node.vector_paths
-        && !paths.is_empty()
+    if will_render_inline_svg {
+        if let Some(ref paths) = node.vector_paths {
+            render_inline_svg(out, node, ind, &classes, paths);
+            return;
+        }
+    }
+
+    // Resolve which asset id this image node references (via Image fill or node.id fallback).
+    let matched_asset_ref: Option<String> = node
+        .style
+        .as_ref()
+        .and_then(|s| s.fills.as_ref())
+        .and_then(|fills| {
+            fills.iter().find_map(|f| {
+                if let Fill::Image { asset_ref, .. } = f {
+                    if asset_map.contains_key(asset_ref) {
+                        Some(asset_ref.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| {
+            if asset_map.contains_key(&node.id) {
+                Some(node.id.clone())
+            } else {
+                None
+            }
+        });
+
+    // If this asset was emitted as an Icon React component, render <IconX /> instead of <img>.
+    if let Some(ref asset_ref) = matched_asset_ref
+        && let Some(icon_name) = icon_map.get(asset_ref)
     {
-        render_inline_svg(out, node, &ind, &classes, paths);
+        used_icons.insert(icon_name.clone());
+        let class_str = join_classes(&classes);
+        if class_str.is_empty() {
+            let _ = writeln!(out, "{ind}<{icon_name} />");
+        } else {
+            let _ = writeln!(out, "{ind}<{icon_name} className=\"{class_str}\" />");
+        }
         return;
     }
 
@@ -640,13 +802,39 @@ fn render_frame_node(
     responsive: bool,
     icon_library: &IconLibrary,
     asset_map: &AssetMap,
+    icon_map: &IconMap,
+    used_icons: &mut FxHashSet<String>,
     warnings: &mut WarningCollector,
 ) {
     let ind = indent(depth);
     let mut classes = Vec::new();
 
     if let Some(ref l) = node.layout {
-        classes.extend(layout::layout_classes(l));
+        // Figma renders text in its own coord system so a flip/large-rotate on a
+        // frame doesn't flip the text visually. CSS transforms propagate to all
+        // descendants including text — which flips glyphs. When this container
+        // has text descendants, strip those transforms to match Figma visuals.
+        let needs_suppression = !node.children.is_empty()
+            && has_text_descendant(node)
+            && (l.flip_x == Some(true)
+                || l.flip_y == Some(true)
+                || l.rotation.is_some_and(|r| r.abs() > 45.0));
+        if needs_suppression {
+            let mut sanitized = l.clone();
+            sanitized.flip_x = None;
+            sanitized.flip_y = None;
+            if sanitized.rotation.is_some_and(|r| r.abs() > 45.0) {
+                sanitized.rotation = None;
+            }
+            warnings.warn(
+                &node.id,
+                &node.name,
+                "Suppressed flip/rotate transform because container has text descendants — CSS would flip text too, which Figma does not. Apply the transform manually on the leaf if intended.",
+            );
+            classes.extend(layout::layout_classes(&sanitized));
+        } else {
+            classes.extend(layout::layout_classes(l));
+        }
     }
     collect_style_classes(&mut classes, node, theme_colors, warnings);
     if is_root && responsive {
@@ -738,6 +926,8 @@ fn render_frame_node(
                     responsive,
                     icon_library,
                     asset_map,
+                    icon_map,
+                    used_icons,
                     warnings,
                 );
                 let _ = writeln!(out, "{}</div>", indent(depth + 2));
@@ -755,6 +945,8 @@ fn render_frame_node(
                     responsive,
                     icon_library,
                     asset_map,
+                    icon_map,
+                    used_icons,
                     warnings,
                 );
             }
@@ -1060,6 +1252,9 @@ mod tests {
                 letter_spacing: None,
                 text_align: None,
                 text_decoration: None,
+                text_decoration_style: None,
+                text_decoration_offset: None,
+                text_decoration_thickness: None,
                 text_transform: None,
                 truncation: None,
                 italic: None,
@@ -1092,7 +1287,8 @@ mod tests {
             "/assets",
             false,
             &IconLibrary::None,
-            &HashMap::new(),
+            &AssetMap::default(),
+            &IconMap::default(),
             &mut warnings,
         );
         assert!(output.contains("export function Card"));
@@ -1113,7 +1309,8 @@ mod tests {
             "/assets",
             false,
             &IconLibrary::None,
-            &HashMap::new(),
+            &AssetMap::default(),
+            &IconMap::default(),
             &mut warnings,
         );
         assert!(output.contains("text-[#000000]"));
@@ -1130,7 +1327,8 @@ mod tests {
             "/assets",
             false,
             &IconLibrary::None,
-            &HashMap::new(),
+            &AssetMap::default(),
+            &IconMap::default(),
             &mut warnings,
         );
         assert!(!output.contains("import { cn }"));
@@ -1155,7 +1353,8 @@ mod tests {
             "/assets",
             false,
             &IconLibrary::None,
-            &HashMap::new(),
+            &AssetMap::default(),
+            &IconMap::default(),
             &mut warnings,
         );
         assert!(output.contains("import { cn }"));
@@ -1191,7 +1390,9 @@ mod tests {
             children: vec![],
             overlay: false,
         };
-        let asset_map: AssetMap = HashMap::from([("asset-123".into(), "hero-image.png".into())]);
+        let asset_map: AssetMap = [("asset-123".into(), "hero-image.png".into())]
+            .into_iter()
+            .collect();
         let parent = simple_frame("Page", vec![image]);
         let output = generate_component(
             &parent,
@@ -1201,6 +1402,7 @@ mod tests {
             false,
             &IconLibrary::None,
             &asset_map,
+            &IconMap::default(),
             &mut warnings,
         );
         assert!(output.contains("<img"));
@@ -1237,7 +1439,8 @@ mod tests {
             "/assets",
             false,
             &IconLibrary::None,
-            &HashMap::new(),
+            &AssetMap::default(),
+            &IconMap::default(),
             &mut warnings,
         );
         // Vector nodes are skipped — icons come from icon libraries
@@ -1260,10 +1463,171 @@ mod tests {
             "/assets",
             false,
             &IconLibrary::None,
-            &HashMap::new(),
+            &AssetMap::default(),
+            &IconMap::default(),
             &mut warnings,
         );
         assert!(output.contains("import { Inter } from 'next/font/google';"));
         assert!(output.contains("const inter = Inter"));
+    }
+
+    #[test]
+    fn test_suppress_transforms_on_text_container() {
+        let mut warnings = WarningCollector::new();
+        let mut parent = simple_frame(
+            "BannerWrap",
+            vec![text_node("Entelligence Benchmark Report 2026")],
+        );
+        if let Some(layout) = parent.layout.as_mut() {
+            layout.rotation = Some(180.0);
+            layout.flip_y = Some(true);
+            layout.flip_x = Some(true);
+        }
+        let output = generate_component(
+            &parent,
+            None,
+            "../utils/cn",
+            "/assets",
+            false,
+            &IconLibrary::None,
+            &AssetMap::default(),
+            &IconMap::default(),
+            &mut warnings,
+        );
+        // Transforms must NOT leak onto the text-containing frame.
+        assert!(
+            !output.contains("rotate-[180"),
+            "rotate-[180 should be suppressed:\n{output}"
+        );
+        assert!(
+            !output.contains("scale-y-[-1]"),
+            "scale-y-[-1] should be suppressed:\n{output}"
+        );
+        assert!(
+            !output.contains("scale-x-[-1]"),
+            "scale-x-[-1] should be suppressed:\n{output}"
+        );
+        assert!(warnings.has_warnings(), "expected suppression warning");
+
+        // Sanity: small rotations on the same container survive.
+        let mut warnings2 = WarningCollector::new();
+        let mut parent2 = simple_frame("Italic", vec![text_node("Slanted")]);
+        if let Some(layout) = parent2.layout.as_mut() {
+            layout.rotation = Some(15.0);
+        }
+        let out2 = generate_component(
+            &parent2,
+            None,
+            "../utils/cn",
+            "/assets",
+            false,
+            &IconLibrary::None,
+            &AssetMap::default(),
+            &IconMap::default(),
+            &mut warnings2,
+        );
+        assert!(
+            out2.contains("rotate-[15.00deg]"),
+            "small rotation should survive:\n{out2}"
+        );
+    }
+
+    #[test]
+    fn test_custom_font_raises_warning_and_emits_fallback() {
+        let mut warnings = WarningCollector::new();
+        let mut title = text_node("Hello");
+        if let Some(text) = title.text.as_mut() {
+            text.font_family = Some("Perfectly Nineties".into());
+        }
+        let node = simple_frame("Card", vec![title]);
+        let output = generate_component(
+            &node,
+            None,
+            "../utils/cn",
+            "/assets",
+            false,
+            &IconLibrary::None,
+            &AssetMap::default(),
+            &IconMap::default(),
+            &mut warnings,
+        );
+        // No dead CSS variable reference in the generated TSX.
+        assert!(
+            !output.contains("font-[var(--font-perfectly-nineties)]"),
+            "custom font must not emit dead CSS var:\n{output}"
+        );
+        // The fallback class is emitted instead.
+        assert!(
+            output.contains("font-sans"),
+            "expected font-sans fallback in output:\n{output}"
+        );
+        // The inline TSX comment is preserved as inline developer documentation.
+        assert!(
+            output.contains("// fig2r: custom font(s) detected: Perfectly Nineties."),
+            "inline comment should remain:\n{output}"
+        );
+        // A stderr-visible warning was raised for the custom font.
+        assert!(warnings.has_warnings(), "expected a custom-font warning");
+        let msg = warnings.warnings()[0].to_string();
+        assert!(
+            msg.contains("Perfectly Nineties") && msg.contains("font-sans"),
+            "warning should mention the family and fallback: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_paragraph_spacing_warns_on_multi_paragraph_text() {
+        let mut warnings = WarningCollector::new();
+        let mut text = text_node("Line one.\n\nLine two.");
+        if let Some(ref mut t) = text.text {
+            t.paragraph_spacing = Some(12.0);
+        }
+        let node = simple_frame("Card", vec![text]);
+        let _ = generate_component(
+            &node,
+            None,
+            "../utils/cn",
+            "/assets",
+            false,
+            &IconLibrary::None,
+            &AssetMap::default(),
+            &IconMap::default(),
+            &mut warnings,
+        );
+        assert!(
+            warnings.has_warnings(),
+            "expected a paragraph_spacing warning"
+        );
+        let msg = warnings.warnings()[0].to_string();
+        assert!(
+            msg.contains("paragraphSpacing") && msg.contains("12"),
+            "warning should mention paragraph spacing value: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_paragraph_spacing_no_warning_for_single_paragraph() {
+        let mut warnings = WarningCollector::new();
+        let mut text = text_node("Single line only.");
+        if let Some(ref mut t) = text.text {
+            t.paragraph_spacing = Some(12.0);
+        }
+        let node = simple_frame("Card", vec![text]);
+        let _ = generate_component(
+            &node,
+            None,
+            "../utils/cn",
+            "/assets",
+            false,
+            &IconLibrary::None,
+            &AssetMap::default(),
+            &IconMap::default(),
+            &mut warnings,
+        );
+        assert!(
+            !warnings.has_warnings(),
+            "no warning expected for single-paragraph text, got: {:?}",
+            warnings.warnings()
+        );
     }
 }

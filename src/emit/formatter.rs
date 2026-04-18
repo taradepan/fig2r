@@ -1,5 +1,48 @@
-pub fn indent(level: usize) -> String {
-    "  ".repeat(level)
+/// Pre-computed indent strings for levels 0..=32. Deeper levels (very rare in real
+/// JSX trees) are handled by slicing into `DEEP`.
+const DEEP: &str = "                                                                                                                                "; // 128 spaces
+const INDENTS: [&str; 33] = [
+    "",
+    "  ",
+    "    ",
+    "      ",
+    "        ",
+    "          ",
+    "            ",
+    "              ",
+    "                ",
+    "                  ",
+    "                    ",
+    "                      ",
+    "                        ",
+    "                          ",
+    "                            ",
+    "                              ",
+    "                                ",
+    "                                  ",
+    "                                    ",
+    "                                      ",
+    "                                        ",
+    "                                          ",
+    "                                            ",
+    "                                              ",
+    "                                                ",
+    "                                                  ",
+    "                                                    ",
+    "                                                      ",
+    "                                                        ",
+    "                                                          ",
+    "                                                            ",
+    "                                                              ",
+    "                                                                ",
+];
+
+pub fn indent(level: usize) -> &'static str {
+    if let Some(s) = INDENTS.get(level) {
+        return s;
+    }
+    let spaces = (level * 2).min(DEEP.len());
+    &DEEP[..spaces]
 }
 
 pub fn to_pascal_case(s: &str) -> String {
@@ -71,6 +114,11 @@ mod tests {
     #[test]
     fn test_indent_two() {
         assert_eq!(indent(2), "    ");
+    }
+
+    #[test]
+    fn test_indent_deep_fallback() {
+        assert!(indent(100).chars().all(|c| c == ' '));
     }
 
     #[test]

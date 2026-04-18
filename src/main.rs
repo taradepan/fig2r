@@ -10,8 +10,12 @@ mod tailwind;
 mod warning;
 
 use clap::Parser;
+use mimalloc::MiMalloc;
 use std::io::Read;
 use std::process;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 use cli::{Cli, Command};
 use codegen::tree::{ConvertOptions, IconLibrary, NamingStyle, SvgMode, generate_file_tree};

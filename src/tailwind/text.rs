@@ -1,34 +1,51 @@
-use crate::ir::schema::{TextAlign, TextDecoration, TextProps, TextTransform, Truncation};
+use crate::codegen::fonts::{custom_font_fallback_class, is_google_font};
+use crate::ir::schema::{
+    TextAlign, TextDecoration, TextDecorationStyle, TextProps, TextTransform, Truncation,
+};
 use crate::tailwind::values;
 
 /// CSS variable name emitted for a google font family (e.g. `--font-jetbrains-mono`).
 /// Must match the `variable:` option in the component's next/font import.
 pub fn google_font_css_var(family: &str) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(family.len() + 7);
+    out.push_str("--font-");
+    let mut last_was_sep = true;
     for ch in family.chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
-        } else {
+            last_was_sep = false;
+        } else if !last_was_sep {
             out.push('-');
+            last_was_sep = true;
         }
     }
-    while out.contains("--") {
-        out = out.replace("--", "-");
+    if out.ends_with('-') {
+        out.pop();
     }
-    format!("--font-{}", out.trim_matches('-'))
+    out
 }
 
 pub fn text_classes(text: &TextProps) -> Vec<String> {
     let mut classes = Vec::new();
 
-    // Font family — emit Tailwind arbitrary class pointing at the CSS variable
-    // populated by next/font (see `google_font_css_var` in codegen).
-    // Inter is treated as the default body font and omitted.
+    // Font family.
+    // - "Inter" is the default body font → omit the class entirely.
+    // - Other Google fonts → emit `font-[var(--font-X)]`; the CSS variable is
+    //   populated by the `next/font/google` import in the generated component.
+    // - Custom (non-Google) fonts → emit a generic `font-serif` / `font-sans`
+    //   fallback. Emitting the CSS variable would be a dead reference (the
+    //   component has no @font-face for it), so the text would fall back to
+    //   the browser default. A user-visible warning is raised separately in
+    //   `codegen::component::generate_font_block`.
     if let Some(ref family) = text.font_family
         && family != "Inter"
     {
-        let css_var = google_font_css_var(family);
-        classes.push(format!("font-[var({css_var})]"));
+        if is_google_font(family) {
+            let css_var = google_font_css_var(family);
+            classes.push(format!("font-[var({css_var})]"));
+        } else {
+            classes.push(custom_font_fallback_class(family).to_string());
+        }
     }
 
     if let Some(size) = text.font_size {
@@ -49,10 +66,39 @@ pub fn text_classes(text: &TextProps) -> Vec<String> {
     }
 
     if let Some(ref decoration) = text.text_decoration {
-        match decoration {
-            TextDecoration::Underline => classes.push("underline".into()),
-            TextDecoration::Strikethrough => classes.push("line-through".into()),
-            TextDecoration::None => {}
+        let is_decorated = match decoration {
+            TextDecoration::Underline => {
+                classes.push("underline".into());
+                true
+            }
+            TextDecoration::Strikethrough => {
+                classes.push("line-through".into());
+                true
+            }
+            TextDecoration::None => false,
+        };
+
+        if is_decorated {
+            // Decoration style — Solid is the default, skip it to keep output clean.
+            if let Some(ref style) = text.text_decoration_style {
+                match style {
+                    TextDecorationStyle::Solid => {}
+                    TextDecorationStyle::Double => classes.push("decoration-double".into()),
+                    TextDecorationStyle::Dotted => classes.push("decoration-dotted".into()),
+                    TextDecorationStyle::Dashed => classes.push("decoration-dashed".into()),
+                    TextDecorationStyle::Wavy => classes.push("decoration-wavy".into()),
+                }
+            }
+
+            // Underline offset (distance from baseline to decoration line).
+            if let Some(offset) = text.text_decoration_offset {
+                classes.push(format!("underline-offset-[{offset}px]"));
+            }
+
+            // Decoration line thickness.
+            if let Some(thickness) = text.text_decoration_thickness {
+                classes.push(format!("decoration-[{thickness}px]"));
+            }
         }
     }
 
@@ -147,6 +193,9 @@ mod tests {
             letter_spacing: None,
             text_align: None,
             text_decoration: None,
+            text_decoration_style: None,
+            text_decoration_offset: None,
+            text_decoration_thickness: None,
             text_transform: None,
             truncation: None,
             italic: None,
@@ -218,6 +267,88 @@ mod tests {
     }
 
     #[test]
+    fn test_decoration_wavy_emits_decoration_wavy_class() {
+        let text = TextProps {
+            text_decoration: Some(TextDecoration::Underline),
+            text_decoration_style: Some(TextDecorationStyle::Wavy),
+            ..make_text("Spelling")
+        };
+        let classes = text_classes(&text);
+        assert!(classes.contains(&"underline".to_string()));
+        assert!(classes.contains(&"decoration-wavy".to_string()));
+    }
+
+    #[test]
+    fn test_decoration_style_solid_is_default_and_omitted() {
+        let text = TextProps {
+            text_decoration: Some(TextDecoration::Underline),
+            text_decoration_style: Some(TextDecorationStyle::Solid),
+            ..make_text("Link")
+        };
+        let classes = text_classes(&text);
+        assert!(classes.contains(&"underline".to_string()));
+        assert!(!classes.iter().any(|c| c.starts_with("decoration-")));
+    }
+
+    #[test]
+    fn test_decoration_offset_emits_underline_offset() {
+        let text = TextProps {
+            text_decoration: Some(TextDecoration::Underline),
+            text_decoration_offset: Some(4.0),
+            ..make_text("Link")
+        };
+        let classes = text_classes(&text);
+        assert!(classes.contains(&"underline-offset-[4px]".to_string()));
+    }
+
+    #[test]
+    fn test_decoration_thickness_emits_arbitrary_class() {
+        let text = TextProps {
+            text_decoration: Some(TextDecoration::Underline),
+            text_decoration_thickness: Some(2.0),
+            ..make_text("Link")
+        };
+        let classes = text_classes(&text);
+        assert!(classes.contains(&"decoration-[2px]".to_string()));
+    }
+
+    #[test]
+    fn test_no_decoration_classes_without_decoration() {
+        // Offset/thickness/style must not leak when text_decoration is None.
+        let text = TextProps {
+            text_decoration: None,
+            text_decoration_style: Some(TextDecorationStyle::Wavy),
+            text_decoration_offset: Some(4.0),
+            text_decoration_thickness: Some(2.0),
+            ..make_text("Plain")
+        };
+        let classes = text_classes(&text);
+        assert!(
+            !classes
+                .iter()
+                .any(|c| c.starts_with("decoration-") || c.starts_with("underline-offset-"))
+        );
+    }
+
+    #[test]
+    fn test_decoration_none_variant_suppresses_subfields() {
+        // TextDecoration::None should be treated as no decoration.
+        let text = TextProps {
+            text_decoration: Some(TextDecoration::None),
+            text_decoration_style: Some(TextDecorationStyle::Wavy),
+            text_decoration_offset: Some(4.0),
+            text_decoration_thickness: Some(2.0),
+            ..make_text("Plain")
+        };
+        let classes = text_classes(&text);
+        assert!(
+            !classes
+                .iter()
+                .any(|c| c.starts_with("decoration-") || c.starts_with("underline-offset-"))
+        );
+    }
+
+    #[test]
     fn test_text_transform_uppercase() {
         let text = TextProps {
             text_transform: Some(TextTransform::Uppercase),
@@ -265,6 +396,53 @@ mod tests {
         };
         let classes = text_classes(&text);
         assert!(classes.contains(&"tracking-[0.05em]".to_string()));
+    }
+
+    #[test]
+    fn test_google_font_emits_css_var() {
+        let text = TextProps {
+            font_family: Some("JetBrains Mono".into()),
+            ..make_text("code")
+        };
+        let classes = text_classes(&text);
+        assert!(classes.contains(&"font-[var(--font-jetbrains-mono)]".to_string()));
+    }
+
+    #[test]
+    fn test_inter_font_is_omitted() {
+        let text = TextProps {
+            font_family: Some("Inter".into()),
+            ..make_text("body")
+        };
+        let classes = text_classes(&text);
+        assert!(!classes.iter().any(|c| c.starts_with("font-")));
+    }
+
+    #[test]
+    fn test_custom_font_falls_back_to_font_serif() {
+        let text = TextProps {
+            font_family: Some("Perfectly Nineties".into()),
+            ..make_text("headline")
+        };
+        let classes = text_classes(&text);
+        // Heuristic: no serif/roman/times hint → font-sans.
+        assert!(classes.contains(&"font-sans".to_string()));
+        assert!(
+            !classes
+                .iter()
+                .any(|c| c.contains("var(--font-perfectly-nineties)"))
+        );
+    }
+
+    #[test]
+    fn test_custom_serif_font_falls_back_to_font_serif() {
+        let text = TextProps {
+            font_family: Some("Perfectly Nineties Serif".into()),
+            ..make_text("headline")
+        };
+        let classes = text_classes(&text);
+        assert!(classes.contains(&"font-serif".to_string()));
+        assert!(!classes.iter().any(|c| c.contains("var(--font-")));
     }
 
     #[test]

@@ -256,6 +256,11 @@ fn border_width_class(prefix: &str, width: f64) -> String {
 
 pub fn effect_classes(effects: &[Effect], _warnings: &mut WarningCollector) -> Vec<String> {
     let mut classes = Vec::new();
+
+    // Collect all shadow effects into a single comma-joined `shadow-[...]` class.
+    // Tailwind merges classes by utility, so multiple `shadow-*` on one element
+    // collapse to the last — we have to stack them into one CSS `box-shadow` list.
+    let mut shadows: Vec<String> = Vec::new();
     for effect in effects {
         match effect {
             Effect::DropShadow {
@@ -263,41 +268,59 @@ pub fn effect_classes(effects: &[Effect], _warnings: &mut WarningCollector) -> V
                 radius,
                 spread,
                 color,
-            } => {
-                let shadow =
-                    match_shadow(offset.x, offset.y, *radius, spread.unwrap_or(0.0), color);
-                classes.push(shadow);
-            }
+            } => shadows.push(shadow_body(
+                offset.x,
+                offset.y,
+                *radius,
+                spread.unwrap_or(0.0),
+                color,
+                false,
+            )),
             Effect::InnerShadow {
                 offset,
                 radius,
                 spread,
                 color,
-            } => {
-                let x = (offset.x * 2.0).round() / 2.0;
-                let y = (offset.y * 2.0).round() / 2.0;
-                let r = (*radius * 2.0).round() / 2.0;
-                let s = (spread.unwrap_or(0.0) * 2.0).round() / 2.0;
-                classes.push(format!("shadow-[inset_{x}px_{y}px_{r}px_{s}px_{color}]"));
-            }
-            Effect::Blur { blur_type, radius } => {
-                match blur_type.as_ref().unwrap_or(&BlurType::Layer) {
-                    BlurType::Layer => classes.push(format!("blur-[{radius}px]")),
-                    BlurType::Background => classes.push(format!("backdrop-blur-[{radius}px]")),
-                }
+            } => shadows.push(shadow_body(
+                offset.x,
+                offset.y,
+                *radius,
+                spread.unwrap_or(0.0),
+                color,
+                true,
+            )),
+            Effect::Blur { .. } => {}
+        }
+    }
+    if !shadows.is_empty() {
+        classes.push(format!("shadow-[{}]", shadows.join(",")));
+    }
+
+    // Blurs are filter-based and don't need stacking like box-shadow.
+    for effect in effects {
+        if let Effect::Blur { blur_type, radius } = effect {
+            match blur_type.as_ref().unwrap_or(&BlurType::Layer) {
+                BlurType::Layer => classes.push(format!("blur-[{radius}px]")),
+                BlurType::Background => classes.push(format!("backdrop-blur-[{radius}px]")),
             }
         }
     }
+
     classes
 }
 
-fn match_shadow(x: f64, y: f64, radius: f64, spread: f64, color: &str) -> String {
-    // Always use arbitrary value with color for pixel-perfect shadows
+fn shadow_body(x: f64, y: f64, radius: f64, spread: f64, color: &str, inset: bool) -> String {
+    // Use underscores for spaces per Tailwind arbitrary value syntax; round to
+    // half-pixel precision for stable output.
     let x = (x * 2.0).round() / 2.0;
     let y = (y * 2.0).round() / 2.0;
     let radius = (radius * 2.0).round() / 2.0;
     let spread = (spread * 2.0).round() / 2.0;
-    format!("shadow-[{x}px_{y}px_{radius}px_{spread}px_{color}]")
+    if inset {
+        format!("inset_{x}px_{y}px_{radius}px_{spread}px_{color}")
+    } else {
+        format!("{x}px_{y}px_{radius}px_{spread}px_{color}")
+    }
 }
 
 pub fn opacity_class(value: f64) -> String {
@@ -471,6 +494,73 @@ mod tests {
         }];
         let classes = effect_classes(&effects, &mut warnings);
         assert!(classes[0].starts_with("shadow-["));
+    }
+
+    #[test]
+    fn test_multi_drop_shadow_combined() {
+        let mut warnings = WarningCollector::new();
+        let effects = vec![
+            Effect::DropShadow {
+                offset: Position { x: 0.0, y: 1.0 },
+                radius: 2.0,
+                spread: Some(0.0),
+                color: "rgba(0,0,0,0.05)".into(),
+            },
+            Effect::DropShadow {
+                offset: Position { x: 0.0, y: 4.0 },
+                radius: 16.0,
+                spread: Some(0.0),
+                color: "rgba(0,0,0,0.1)".into(),
+            },
+        ];
+        let classes = effect_classes(&effects, &mut warnings);
+        // Exactly one shadow-[...] class — the two shadows must be comma-joined.
+        let shadow_classes: Vec<&String> = classes
+            .iter()
+            .filter(|c| c.starts_with("shadow-["))
+            .collect();
+        assert_eq!(
+            shadow_classes.len(),
+            1,
+            "expected one combined shadow class"
+        );
+        let c = shadow_classes[0];
+        assert!(c.contains("0px_1px_2px_0px_rgba(0,0,0,0.05)"));
+        assert!(c.contains("0px_4px_16px_0px_rgba(0,0,0,0.1)"));
+        // Comma separator between the two shadow bodies, no spaces inside brackets.
+        assert!(c.contains("),0px_"));
+        assert!(!c.contains(' '));
+    }
+
+    #[test]
+    fn test_inner_and_drop_shadow_combined() {
+        let mut warnings = WarningCollector::new();
+        let effects = vec![
+            Effect::DropShadow {
+                offset: Position { x: 0.0, y: 2.0 },
+                radius: 4.0,
+                spread: None,
+                color: "#000".into(),
+            },
+            Effect::InnerShadow {
+                offset: Position { x: 0.0, y: 1.0 },
+                radius: 2.0,
+                spread: None,
+                color: "#111".into(),
+            },
+        ];
+        let classes = effect_classes(&effects, &mut warnings);
+        let shadow_classes: Vec<&String> = classes
+            .iter()
+            .filter(|c| c.starts_with("shadow-["))
+            .collect();
+        assert_eq!(shadow_classes.len(), 1);
+        let c = shadow_classes[0];
+        assert!(c.contains("inset_"));
+        // Drop shadow should come first (same relative order as in effects slice).
+        let drop_idx = c.find("0px_2px_4px_0px_#000").unwrap();
+        let inner_idx = c.find("inset_0px_1px_2px_0px_#111").unwrap();
+        assert!(drop_idx < inner_idx);
     }
 
     #[test]
