@@ -23,8 +23,13 @@ jobs:
         shell: bash
         run: |
           CURR=$(node -p "require('./package.json').version")
+          CARGO_V=$(awk -F\" '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)
+          if [ "$CURR" != "$CARGO_V" ]; then
+            echo "::error::package.json version ($CURR) != Cargo.toml version ($CARGO_V). Bump both before releasing — the Rust binary reports CARGO_PKG_VERSION."
+            exit 1
+          fi
           PUBLISHED=$(npm view fig2r version 2>/dev/null || echo "")
-          echo "Local: $CURR  On npm: ${PUBLISHED:-<unpublished>}"
+          echo "Local: $CURR  Cargo: $CARGO_V  On npm: ${PUBLISHED:-<unpublished>}"
           echo "version=$CURR" >> "$GITHUB_OUTPUT"
           if [ "$CURR" != "$PUBLISHED" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
